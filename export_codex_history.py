@@ -14,7 +14,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -40,6 +40,12 @@ class ParsedConversation:
     messages: Tuple[ChatMessage, ...]
     last_timestamp: datetime
     archived: bool
+
+
+@dataclass(frozen=True)
+class ResolvedProject:
+    name: str
+    path: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -308,6 +314,7 @@ class ProjectResolver:
         self.assignments = assignments
         self.projectless_ids = set(projectless_ids)
         roots = []
+        self.project_roots: Dict[str, List[Tuple[str, str]]] = {}
         for project_id, project in projects.items():
             if not isinstance(project, dict):
                 continue
@@ -317,8 +324,16 @@ class ProjectResolver:
             for root_path in project.get("rootPaths", []):
                 normalized = _normalize_path(root_path)
                 if normalized:
-                    roots.append((normalized, name.strip(), project_id))
+                    display_path = root_path.strip()
+                    roots.append(
+                        (normalized, name.strip(), project_id, display_path)
+                    )
+                    self.project_roots.setdefault(project_id, []).append(
+                        (normalized, display_path)
+                    )
         self.roots = sorted(roots, key=lambda item: len(item[0]), reverse=True)
+        for project_roots in self.project_roots.values():
+            project_roots.sort(key=lambda item: len(item[0]), reverse=True)
 
     @classmethod
     def from_codex_home(cls, codex_home: Path) -> "ProjectResolver":
@@ -340,30 +355,51 @@ class ProjectResolver:
             projectless_ids if isinstance(projectless_ids, list) else [],
         )
 
-    def resolve(self, conversation: ParsedConversation) -> str:
+    def _configured_root(
+        self, project_id: str, normalized_cwd: Optional[str]
+    ) -> Optional[str]:
+        roots = self.project_roots.get(project_id, [])
+        if normalized_cwd is not None:
+            for normalized_root, display_path in roots:
+                if _is_under_path(normalized_cwd, normalized_root):
+                    return display_path
+        return roots[0][1] if roots else None
+
+    def resolve_with_path(self, conversation: ParsedConversation) -> ResolvedProject:
+        cwd = _normalize_path(conversation.cwd)
         assignment = self.assignments.get(conversation.thread_id)
         if isinstance(assignment, dict) and assignment.get("projectKind") == "local":
-            project = self.projects.get(assignment.get("projectId"))
+            project_id = assignment.get("projectId")
+            project = self.projects.get(project_id)
             if isinstance(project, dict):
                 name = project.get("name")
                 if isinstance(name, str) and name.strip():
-                    return name.strip()
+                    return ResolvedProject(
+                        name.strip(),
+                        self._configured_root(project_id, cwd)
+                        if isinstance(project_id, str)
+                        else None,
+                    )
 
         if conversation.thread_id in self.projectless_ids:
-            return "chat"
+            return ResolvedProject("chat", None)
 
-        cwd = _normalize_path(conversation.cwd)
         if cwd is None:
-            return "chat"
-        for root, name, _project_id in self.roots:
+            return ResolvedProject("chat", None)
+        for root, name, _project_id, display_path in self.roots:
             if _is_under_path(cwd, root):
-                return name
+                return ResolvedProject(name, display_path)
 
         home = _normalize_path(str(Path.home()))
         if home is not None and cwd == home:
-            return "chat"
+            return ResolvedProject("chat", None)
         name = _path_name(conversation.cwd or "")
-        return name.strip() or "chat"
+        if not name.strip():
+            return ResolvedProject("chat", None)
+        return ResolvedProject(name.strip(), (conversation.cwd or "").strip())
+
+    def resolve(self, conversation: ParsedConversation) -> str:
+        return self.resolve_with_path(conversation).name
 
 
 def safe_component(value: str, fallback: str, limit: int = 120) -> str:
@@ -409,6 +445,31 @@ def render_markdown(
             ]
         )
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _toml_string(value: str) -> str:
+    if "'''" not in value and "\r" not in value and "\n" not in value:
+        return "'''{}'''".format(value)
+    return json.dumps(value, ensure_ascii=False)
+
+
+def render_project_index(project_paths: Dict[str, Iterable[str]]) -> str:
+    """Render project working directories as deterministic, valid TOML."""
+    lines = ["# Generated by export_codex_history.py."]
+    for project in sorted(project_paths, key=str.casefold):
+        paths = sorted(set(project_paths[project]), key=str.casefold)
+        if not paths or project == "chat":
+            continue
+        lines.extend(["", "[{}]".format(json.dumps(project, ensure_ascii=False))])
+        if len(paths) == 1:
+            lines.append("Path = {}".format(_toml_string(paths[0])))
+        else:
+            lines.append(
+                "Paths = [{}]".format(
+                    ", ".join(_toml_string(path) for path in paths)
+                )
+            )
+    return "\n".join(lines) + "\n"
 
 
 def _conversation_title(conversation: ParsedConversation, titles: Dict[str, str]) -> str:
@@ -554,6 +615,7 @@ def export_history(codex_home: Path, output_root: Path) -> ExportSummary:
     skipped = 0
     malformed_lines = 0
     allocated = set()
+    project_paths: Dict[str, Set[str]] = {}
     try:
         for rollout in rollouts:
             outcome = _parse_rollout_with_status(rollout)
@@ -566,7 +628,10 @@ def export_history(codex_home: Path, output_root: Path) -> ExportSummary:
                 skipped += 1
                 continue
             title = _conversation_title(conversation, titles)
-            project = resolver.resolve(conversation)
+            resolved_project = resolver.resolve_with_path(conversation)
+            project = resolved_project.name
+            if project != "chat" and resolved_project.path:
+                project_paths.setdefault(project, set()).add(resolved_project.path)
             target = _allocate_output_path(
                 staging, project, conversation, title, allocated
             )
@@ -574,6 +639,10 @@ def export_history(codex_home: Path, output_root: Path) -> ExportSummary:
             with target.open("w", encoding="utf-8", newline="\n") as stream:
                 stream.write(render_markdown(conversation, title, project))
             exported += 1
+        with (staging / "projects.toml").open(
+            "w", encoding="utf-8", newline="\n"
+        ) as stream:
+            stream.write(render_project_index(project_paths))
         _publish_staging(staging, output_root, backup)
     except Exception:
         if staging.exists() and not staging.is_symlink():

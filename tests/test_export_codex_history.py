@@ -8,6 +8,11 @@ from unittest import mock
 
 import export_codex_history as exporter
 
+try:
+    import tomllib
+except ImportError:  # Python 3.9 and 3.10 do not include tomllib.
+    tomllib = None
+
 
 def write_jsonl(path, rows):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -236,6 +241,54 @@ class MetadataAndProjectTests(unittest.TestCase):
                 "chat",
             )
 
+    def test_project_resolution_also_reports_the_indexed_working_directory(self):
+        projects = {
+            "p1": {
+                "name": "Alpha Project",
+                "rootPaths": [r"C:\Work\Alpha", r"D:\Mirrors\Alpha"],
+            }
+        }
+        assignments = {
+            "thread-explicit": {"projectKind": "local", "projectId": "p1"}
+        }
+        resolver = exporter.ProjectResolver(
+            projects, assignments, ["thread-chat"]
+        )
+
+        explicit = resolver.resolve_with_path(
+            conversation_stub("thread-explicit", r"D:\Mirrors\Alpha\src")
+        )
+        projectless = resolver.resolve_with_path(
+            conversation_stub("thread-chat", r"C:\Work\Alpha")
+        )
+        inferred = resolver.resolve_with_path(
+            conversation_stub("thread-other", r"C:\Work\Other")
+        )
+
+        self.assertEqual(explicit.name, "Alpha Project")
+        self.assertEqual(explicit.path, r"D:\Mirrors\Alpha")
+        self.assertEqual(projectless.name, "chat")
+        self.assertIsNone(projectless.path)
+        self.assertEqual(inferred.name, "Other")
+        self.assertEqual(inferred.path, r"C:\Work\Other")
+
+    @unittest.skipIf(tomllib is None, "tomllib is unavailable before Python 3.11")
+    def test_project_index_is_valid_toml_and_supports_multiple_paths(self):
+        rendered = exporter.render_project_index(
+            {
+                "Alpha Project": {r"C:\Work\Alpha"},
+                "多目录": {r"C:\One", r"D:\Two"},
+            }
+        )
+
+        parsed = tomllib.loads(rendered)
+
+        self.assertEqual(parsed["Alpha Project"]["Path"], r"C:\Work\Alpha")
+        self.assertEqual(
+            set(parsed["多目录"]["Paths"]), {r"C:\One", r"D:\Two"}
+        )
+        self.assertNotIn("chat", parsed)
+
     def test_safe_component_handles_invalid_and_reserved_windows_names(self):
         self.assertEqual(exporter.safe_component('a<b>:c"d/e\\f|g?h*', "fallback"), "a_b__c_d_e_f_g_h_")
         self.assertEqual(exporter.safe_component("CON", "fallback"), "_CON")
@@ -294,6 +347,12 @@ class EndToEndTests(unittest.TestCase):
             self.assertFalse((output / "stale.md").exists())
             self.assertNotEqual(files[0].name, files[1].name)
             self.assertTrue(all(path.parent.name == "Alpha" for path in files))
+            self.assertTrue((output / "projects.toml").is_file())
+            if tomllib is not None:
+                index = tomllib.loads(
+                    (output / "projects.toml").read_text(encoding="utf-8")
+                )
+                self.assertEqual(index["Alpha"]["Path"], r"C:\Work\Alpha")
 
     def test_cli_always_writes_to_project_output_directory(self):
         with tempfile.TemporaryDirectory() as temp:

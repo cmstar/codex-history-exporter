@@ -31,6 +31,7 @@ python .\export_codex_history.py --codex-home "D:\Backup\.codex"
 
 ```text
 .output/
+├── projects.toml
 ├── chat/
 │   └── yyyyMMddHHmmss__会话名.md
 ├── 项目1/
@@ -38,6 +39,15 @@ python .\export_codex_history.py --codex-home "D:\Backup\.codex"
 └── 项目2/
     └── yyyyMMddHHmmss__会话名.md
 ```
+
+`projects.toml` 记录各项目对应的工作目录。只有一个目录时使用 `Path`：
+
+```toml
+["项目1"]
+Path = '''D:\Workspace\项目1'''
+```
+
+如果同名项目关联到多个目录，则使用 `Paths` 数组。`chat` 可能包含多个互不相关的工作目录，因此不会写入此索引。
 
 每次执行都会完整重建 `.output`。脚本先在 staging 目录生成全部文件，成功后才替换现有输出；生成阶段失败时会保留上一次的 `.output`。如果 Windows 文件监视器锁住 `.output` 根目录、使目录无法整体改名，脚本会自动改用带备份和回滚的目录内替换。
 
