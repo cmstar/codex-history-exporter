@@ -1,0 +1,6 @@
+/.output/
+/.output.__staging__/
+/.output.__backup__/
+__pycache__/
+*.py[cod]
+
