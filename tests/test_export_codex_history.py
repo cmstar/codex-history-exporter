@@ -354,18 +354,75 @@ class EndToEndTests(unittest.TestCase):
                 )
                 self.assertEqual(index["Alpha"]["Path"], r"C:\Work\Alpha")
 
-    def test_cli_always_writes_to_project_output_directory(self):
+    def test_cli_defaults_to_current_working_directory_output(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             codex_home = self.make_codex_home(root)
-            project_root = root / "project"
-            project_root.mkdir()
+            working_directory = root / "working"
+            working_directory.mkdir()
 
-            with mock.patch.object(exporter, "PROJECT_ROOT", project_root):
+            with mock.patch.object(Path, "cwd", return_value=working_directory):
                 exit_code = exporter.main(["--codex-home", str(codex_home)])
 
             self.assertEqual(exit_code, 0)
-            self.assertEqual(len(list((project_root / ".output").rglob("*.md"))), 2)
+            self.assertEqual(
+                len(list((working_directory / "output").rglob("*.md"))), 2
+            )
+
+    def test_cli_declines_to_replace_a_nonempty_output_directory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            codex_home = self.make_codex_home(root)
+            output = root / "existing-output"
+            output.mkdir()
+            stale = output / "keep.txt"
+            stale.write_text("keep", encoding="utf-8")
+
+            with mock.patch("builtins.input", return_value="n"):
+                exit_code = exporter.main(
+                    ["--codex-home", str(codex_home), "--output", str(output)]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(stale.read_text(encoding="utf-8"), "keep")
+            self.assertEqual(list(output.rglob("*.md")), [])
+
+    def test_cli_replaces_a_nonempty_output_after_confirmation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            codex_home = self.make_codex_home(root)
+            output = root / "confirmed-output"
+            output.mkdir()
+            stale = output / "stale.txt"
+            stale.write_text("old", encoding="utf-8")
+
+            with mock.patch("builtins.input", return_value="yes"):
+                exit_code = exporter.main(
+                    ["--codex-home", str(codex_home), "--output", str(output)]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertFalse(stale.exists())
+            self.assertEqual(len(list(output.rglob("*.md"))), 2)
+
+    def test_cli_force_replaces_custom_output_without_prompting(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            codex_home = self.make_codex_home(root)
+            output = root / "custom-output"
+            output.mkdir()
+            (output / "stale.txt").write_text("old", encoding="utf-8")
+
+            with mock.patch(
+                "builtins.input", side_effect=AssertionError("must not prompt")
+            ):
+                exit_code = exporter.main(
+                    ["--codex-home", str(codex_home), "-o", str(output), "-f"]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertFalse((output / "stale.txt").exists())
+            self.assertEqual(len(list(output.rglob("*.md"))), 2)
 
 
 class OutputSafetyTests(unittest.TestCase):

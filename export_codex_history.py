@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
 INVALID_COMPONENT_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 WINDOWS_RESERVED_NAMES = re.compile(
     r"^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$", re.IGNORECASE
@@ -668,6 +667,28 @@ def _default_codex_home(argument: Optional[str]) -> Path:
     return Path.home() / ".codex"
 
 
+def _confirm_output_replacement(output_root: Path, force: bool) -> bool:
+    if output_root.is_symlink():
+        raise RuntimeError(
+            "refusing to replace symbolic-link path: {}".format(output_root)
+        )
+    if not output_root.exists():
+        return True
+    if not output_root.is_dir():
+        raise RuntimeError("output path is not a directory: {}".format(output_root))
+    if not any(output_root.iterdir()) or force:
+        return True
+    try:
+        answer = input(
+            "Output directory '{}' is not empty. Overwrite its contents? [y/N]: ".format(
+                output_root
+            )
+        )
+    except EOFError:
+        answer = ""
+    return answer.strip().casefold() in {"y", "yes"}
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Export local Codex conversations as project-grouped Markdown."
@@ -676,10 +697,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--codex-home",
         help="Codex data directory (default: CODEX_HOME or ~/.codex)",
     )
+    parser.add_argument(
+        "-o",
+        "--output",
+        help="Output directory (default: ./output in the current working directory)",
+    )
+    parser.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="replace a nonempty output directory without prompting",
+    )
     arguments = parser.parse_args(argv)
     try:
+        output_root = _absolute_without_resolving(
+            Path(arguments.output).expanduser()
+            if arguments.output
+            else Path.cwd() / "output"
+        )
+        if not _confirm_output_replacement(output_root, arguments.force):
+            print("Export cancelled. Existing output was not changed.")
+            return 0
         summary = export_history(
-            _default_codex_home(arguments.codex_home), PROJECT_ROOT / ".output"
+            _default_codex_home(arguments.codex_home), output_root
         )
     except (OSError, RuntimeError, sqlite3.Error) as error:
         print("error: {}".format(error), file=sys.stderr)

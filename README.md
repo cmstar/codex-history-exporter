@@ -27,10 +27,10 @@ python .\export_codex_history.py
 python .\export_codex_history.py --codex-home "D:\Backup\.codex"
 ```
 
-无论从哪个工作目录启动，结果都固定写入本项目根目录的 `.output`：
+默认结果写入运行命令时所在目录的 `output` 子目录：
 
 ```text
-.output/
+output/
 ├── projects.toml
 ├── chat/
 │   └── yyyyMMddHHmmss__会话名.md
@@ -38,6 +38,19 @@ python .\export_codex_history.py --codex-home "D:\Backup\.codex"
 │   └── yyyyMMddHHmmss__会话名.md
 └── 项目2/
     └── yyyyMMddHHmmss__会话名.md
+```
+
+使用 `-o` 或 `--output` 可以指定其他输出目录；相对路径以当前工作目录为基准：
+
+```powershell
+python .\export_codex_history.py --output "D:\Backup\codex-history"
+python .\export_codex_history.py -o ".\history"
+```
+
+如果输出目录已经存在且非空，脚本会在覆盖前询问。输入 `y` 或 `yes` 才会继续；也可以使用 `-f` / `--force` 跳过询问并直接覆盖：
+
+```powershell
+python .\export_codex_history.py -o ".\history" -f
 ```
 
 `projects.toml` 记录各项目对应的工作目录。只有一个目录时使用 `Path`：
@@ -49,7 +62,7 @@ Path = '''D:\Workspace\项目1'''
 
 如果同名项目关联到多个目录，则使用 `Paths` 数组。`chat` 可能包含多个互不相关的工作目录，因此不会写入此索引。
 
-每次执行都会完整重建 `.output`。脚本先在 staging 目录生成全部文件，成功后才替换现有输出；生成阶段失败时会保留上一次的 `.output`。如果 Windows 文件监视器锁住 `.output` 根目录、使目录无法整体改名，脚本会自动改用带备份和回滚的目录内替换。
+确认覆盖后，每次执行都会完整重建目标目录。脚本先在 staging 目录生成全部文件，成功后才替换现有输出；生成阶段失败时会保留上一次的结果。如果 Windows 文件监视器锁住输出根目录、使目录无法整体改名，脚本会自动改用带备份和回滚的目录内替换。
 
 ## 项目判断规则
 
