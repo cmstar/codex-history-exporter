@@ -28,6 +28,20 @@ python ./export_codex_history.py
 python ./export_codex_history.py --codex-home ~/Backup/.codex
 ```
 
+默认会导出所有主会话。若只想导出一个会话，可以传入完整的 session ID：
+
+```powershell
+python ./export_codex_history.py "019c1234-5678-7abc-9def-0123456789ab"
+```
+
+也可以继续使用具名参数写法：
+
+```powershell
+python ./export_codex_history.py --session-id "019c1234-5678-7abc-9def-0123456789ab"
+```
+
+脚本会按 session 元数据中的 ID 进行完全匹配。单个会话导出时不会生成全量导出使用的 `projects.toml`。找不到该 ID、会话属于 sub-agent，或会话没有可导出的消息时，脚本会返回错误且不会替换已有输出。
+
 默认结果写入运行命令时所在目录的 `output` 子目录：
 
 ```text

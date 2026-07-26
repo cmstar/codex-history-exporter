@@ -354,6 +354,44 @@ class EndToEndTests(unittest.TestCase):
                 )
                 self.assertEqual(index["Alpha"]["Path"], r"C:\Work\Alpha")
 
+    def test_export_can_select_one_session_by_exact_id(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            codex_home = self.make_codex_home(root)
+            output = root / "selected-output"
+
+            summary = exporter.export_history(
+                codex_home, output, session_id="thread-two"
+            )
+
+            files = list(output.rglob("*.md"))
+            self.assertEqual(summary.exported, 1)
+            self.assertEqual(len(files), 1)
+            self.assertFalse((output / "projects.toml").exists())
+            markdown = files[0].read_text(encoding="utf-8")
+            self.assertIn("Thread ID: `thread-two`", markdown)
+            self.assertIn("问题二", markdown)
+            self.assertNotIn("问题一", markdown)
+
+    def test_unknown_session_id_preserves_existing_output(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            codex_home = self.make_codex_home(root)
+            output = root / "existing-output"
+            output.mkdir()
+            existing = output / "keep.txt"
+            existing.write_text("keep", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "session ID not found"):
+                exporter.export_history(
+                    codex_home, output, session_id="missing-session"
+                )
+
+            self.assertEqual(existing.read_text(encoding="utf-8"), "keep")
+            self.assertFalse(
+                output.with_name(output.name + ".__staging__").exists()
+            )
+
     def test_cli_defaults_to_current_working_directory_output(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -367,6 +405,57 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertEqual(
                 len(list((working_directory / "output").rglob("*.md"))), 2
+            )
+
+    def test_cli_accepts_session_id_as_a_positional_argument(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            codex_home = self.make_codex_home(root)
+            output = root / "selected-output"
+
+            exit_code = exporter.main(
+                [
+                    "thread-one",
+                    "--codex-home",
+                    str(codex_home),
+                    "--output",
+                    str(output),
+                ]
+            )
+
+            files = list(output.rglob("*.md"))
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(len(files), 1)
+            self.assertFalse((output / "projects.toml").exists())
+            self.assertIn(
+                "Thread ID: `thread-one`",
+                files[0].read_text(encoding="utf-8"),
+            )
+
+    def test_cli_keeps_the_named_session_id_form_for_compatibility(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            codex_home = self.make_codex_home(root)
+            output = root / "selected-output"
+
+            exit_code = exporter.main(
+                [
+                    "--session-id",
+                    "thread-two",
+                    "--codex-home",
+                    str(codex_home),
+                    "--output",
+                    str(output),
+                ]
+            )
+
+            files = list(output.rglob("*.md"))
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(len(files), 1)
+            self.assertFalse((output / "projects.toml").exists())
+            self.assertIn(
+                "Thread ID: `thread-two`",
+                files[0].read_text(encoding="utf-8"),
             )
 
     def test_cli_declines_to_replace_a_nonempty_output_directory(self):

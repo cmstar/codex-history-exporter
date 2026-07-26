@@ -99,7 +99,9 @@ def _is_subagent(meta: dict) -> bool:
     return isinstance(source, dict) and "subagent" in source
 
 
-def _parse_rollout_with_status(path: Path) -> _ParseOutcome:
+def _parse_rollout_with_status(
+    path: Path, session_id: Optional[str] = None
+) -> _ParseOutcome:
     meta = None
     visible_messages: List[ChatMessage] = []
     fallback_answers: List[ChatMessage] = []
@@ -132,6 +134,8 @@ def _parse_rollout_with_status(path: Path) -> _ParseOutcome:
                 continue
             if row_type == "session_meta" and meta is None:
                 meta = payload
+                if session_id is not None and meta.get("id") != session_id:
+                    return _ParseOutcome(None, "filtered", 0)
                 continue
 
             timestamp = _parse_timestamp(row.get("timestamp"))
@@ -174,6 +178,8 @@ def _parse_rollout_with_status(path: Path) -> _ParseOutcome:
                     sequence += 1
 
     if not isinstance(meta, dict):
+        if session_id is not None:
+            return _ParseOutcome(None, "filtered", 0)
         return _ParseOutcome(None, "invalid", malformed_lines)
     if _is_subagent(meta):
         return _ParseOutcome(None, "subagent", malformed_lines)
@@ -595,11 +601,17 @@ def _publish_staging(staging: Path, output_root: Path, backup: Path) -> None:
         shutil.rmtree(backup)
 
 
-def export_history(codex_home: Path, output_root: Path) -> ExportSummary:
+def export_history(
+    codex_home: Path, output_root: Path, session_id: Optional[str] = None
+) -> ExportSummary:
     codex_home = Path(codex_home).expanduser().resolve()
     output_root = _absolute_without_resolving(Path(output_root).expanduser())
     if not codex_home.is_dir():
         raise FileNotFoundError("Codex home does not exist: {}".format(codex_home))
+    if session_id is not None:
+        session_id = session_id.strip()
+        if not session_id:
+            raise ValueError("session ID cannot be empty")
 
     rollouts = _discover_rollouts(codex_home)
     titles = load_titles(codex_home)
@@ -613,11 +625,16 @@ def export_history(codex_home: Path, output_root: Path) -> ExportSummary:
     excluded_subagents = 0
     skipped = 0
     malformed_lines = 0
+    matched_rollouts = 0
     allocated = set()
     project_paths: Dict[str, Set[str]] = {}
     try:
         for rollout in rollouts:
-            outcome = _parse_rollout_with_status(rollout)
+            outcome = _parse_rollout_with_status(rollout, session_id)
+            if outcome.status == "filtered":
+                continue
+            if session_id is not None:
+                matched_rollouts += 1
             malformed_lines += outcome.malformed_lines
             if outcome.status == "subagent":
                 excluded_subagents += 1
@@ -638,10 +655,23 @@ def export_history(codex_home: Path, output_root: Path) -> ExportSummary:
             with target.open("w", encoding="utf-8", newline="\n") as stream:
                 stream.write(render_markdown(conversation, title, project))
             exported += 1
-        with (staging / "projects.toml").open(
-            "w", encoding="utf-8", newline="\n"
-        ) as stream:
-            stream.write(render_project_index(project_paths))
+        if session_id is not None and exported == 0:
+            if matched_rollouts == 0:
+                raise RuntimeError("session ID not found: {}".format(session_id))
+            if excluded_subagents:
+                raise RuntimeError(
+                    "session ID belongs to a sub-agent and cannot be exported: {}".format(
+                        session_id
+                    )
+                )
+            raise RuntimeError(
+                "session has no exportable messages: {}".format(session_id)
+            )
+        if session_id is None:
+            with (staging / "projects.toml").open(
+                "w", encoding="utf-8", newline="\n"
+            ) as stream:
+                stream.write(render_project_index(project_paths))
         _publish_staging(staging, output_root, backup)
     except Exception:
         if staging.exists() and not staging.is_symlink():
@@ -694,6 +724,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         description="Export local Codex conversations as project-grouped Markdown."
     )
     parser.add_argument(
+        "session_id",
+        nargs="?",
+        metavar="SESSION_ID",
+        help="export only the main session whose ID exactly matches SESSION_ID",
+    )
+    parser.add_argument(
         "--codex-home",
         help="Codex data directory (default: CODEX_HOME or ~/.codex)",
     )
@@ -708,7 +744,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         action="store_true",
         help="replace a nonempty output directory without prompting",
     )
+    parser.add_argument(
+        "--session-id",
+        dest="named_session_id",
+        metavar="ID",
+        help="named form of the optional SESSION_ID positional argument",
+    )
     arguments = parser.parse_args(argv)
+    if arguments.session_id is not None and arguments.named_session_id is not None:
+        parser.error("SESSION_ID and --session-id cannot be used together")
+    session_id = arguments.named_session_id or arguments.session_id
     try:
         output_root = _absolute_without_resolving(
             Path(arguments.output).expanduser()
@@ -719,9 +764,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print("Export cancelled. Existing output was not changed.")
             return 0
         summary = export_history(
-            _default_codex_home(arguments.codex_home), output_root
+            _default_codex_home(arguments.codex_home),
+            output_root,
+            session_id=session_id,
         )
-    except (OSError, RuntimeError, sqlite3.Error) as error:
+    except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
         print("error: {}".format(error), file=sys.stderr)
         return 1
     print("Codex history export complete")
