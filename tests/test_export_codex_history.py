@@ -67,6 +67,14 @@ def agent_response_row(text="回退回答", timestamp="2026-07-19T01:02:00Z"):
     }
 
 
+def rollback_row(num_turns=1, timestamp="2026-07-19T01:03:00Z"):
+    return {
+        "timestamp": timestamp,
+        "type": "event_msg",
+        "payload": {"type": "thread_rolled_back", "num_turns": num_turns},
+    }
+
+
 def conversation_stub(thread_id, cwd):
     return exporter.ParsedConversation(
         thread_id=thread_id,
@@ -142,6 +150,62 @@ class RolloutParsingTests(unittest.TestCase):
             self.assertEqual(
                 [(message.role, message.text) for message in conversation.messages],
                 [("user", "用户问题"), ("assistant", "旧版回答")],
+            )
+
+    def test_keeps_only_the_final_branch_after_repeated_message_edits(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "rollout.jsonl"
+            write_jsonl(
+                path,
+                [
+                    meta_row(),
+                    user_row("问题第一版", "2026-07-19T01:01:00Z"),
+                    agent_event_row("第一版回答", timestamp="2026-07-19T01:02:00Z"),
+                    rollback_row(1, "2026-07-19T01:03:00Z"),
+                    user_row("问题第二版", "2026-07-19T01:04:00Z"),
+                    agent_event_row("第二版回答", timestamp="2026-07-19T01:05:00Z"),
+                    user_row("第二版之后的追问", "2026-07-19T01:06:00Z"),
+                    agent_event_row("追问回答", timestamp="2026-07-19T01:07:00Z"),
+                    rollback_row(2, "2026-07-19T01:08:00Z"),
+                    user_row("问题最终版", "2026-07-19T01:09:00Z"),
+                    agent_event_row("最终版回答", timestamp="2026-07-19T01:10:00Z"),
+                ],
+            )
+
+            conversation = exporter.parse_rollout(path)
+
+            self.assertEqual(
+                [(message.role, message.text) for message in conversation.messages],
+                [("user", "问题最终版"), ("assistant", "最终版回答")],
+            )
+
+    def test_uses_fallback_answer_per_surviving_turn(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "rollout.jsonl"
+            write_jsonl(
+                path,
+                [
+                    meta_row(),
+                    user_row("第一问", "2026-07-19T01:01:00Z"),
+                    agent_response_row("第一问的旧版回答", "2026-07-19T01:02:00Z"),
+                    rollback_row(1, "2026-07-19T01:03:00Z"),
+                    user_row("第一问最终版", "2026-07-19T01:04:00Z"),
+                    agent_response_row("第一问最终回答", "2026-07-19T01:05:00Z"),
+                    user_row("第二问", "2026-07-19T01:06:00Z"),
+                    agent_event_row("第二问回答", timestamp="2026-07-19T01:07:00Z"),
+                ],
+            )
+
+            conversation = exporter.parse_rollout(path)
+
+            self.assertEqual(
+                [(message.role, message.text) for message in conversation.messages],
+                [
+                    ("user", "第一问最终版"),
+                    ("assistant", "第一问最终回答"),
+                    ("user", "第二问"),
+                    ("assistant", "第二问回答"),
+                ],
             )
 
 

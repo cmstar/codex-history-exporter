@@ -64,6 +64,13 @@ class _ParseOutcome:
     malformed_lines: int
 
 
+@dataclass
+class _ConversationTurn:
+    user_message: ChatMessage
+    final_answers: List[ChatMessage]
+    fallback_answers: List[ChatMessage]
+
+
 def _parse_timestamp(value: object) -> Optional[datetime]:
     if not isinstance(value, str) or not value.strip():
         return None
@@ -103,8 +110,7 @@ def _parse_rollout_with_status(
     path: Path, session_id: Optional[str] = None
 ) -> _ParseOutcome:
     meta = None
-    visible_messages: List[ChatMessage] = []
-    fallback_answers: List[ChatMessage] = []
+    turns: List[_ConversationTurn] = []
     malformed_lines = 0
     sequence = 0
 
@@ -138,6 +144,16 @@ def _parse_rollout_with_status(
                     return _ParseOutcome(None, "filtered", 0)
                 continue
 
+            if row_type == "event_msg" and payload.get("type") == "thread_rolled_back":
+                num_turns = payload.get("num_turns")
+                if (
+                    isinstance(num_turns, int)
+                    and not isinstance(num_turns, bool)
+                    and num_turns > 0
+                ):
+                    del turns[max(0, len(turns) - num_turns) :]
+                continue
+
             timestamp = _parse_timestamp(row.get("timestamp"))
             if timestamp is None:
                 timestamp = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
@@ -145,8 +161,12 @@ def _parse_rollout_with_status(
             if row_type == "event_msg" and payload.get("type") == "user_message":
                 text = payload.get("message")
                 if isinstance(text, str) and text.strip():
-                    visible_messages.append(
-                        ChatMessage("user", text, timestamp, sequence)
+                    turns.append(
+                        _ConversationTurn(
+                            ChatMessage("user", text, timestamp, sequence),
+                            [],
+                            [],
+                        )
                     )
                     sequence += 1
                 continue
@@ -157,8 +177,8 @@ def _parse_rollout_with_status(
                 and payload.get("phase") == "final_answer"
             ):
                 text = payload.get("message")
-                if isinstance(text, str) and text.strip():
-                    visible_messages.append(
+                if turns and isinstance(text, str) and text.strip():
+                    turns[-1].final_answers.append(
                         ChatMessage("assistant", text, timestamp, sequence)
                     )
                     sequence += 1
@@ -171,8 +191,8 @@ def _parse_rollout_with_status(
                 and payload.get("phase") == "final_answer"
             ):
                 text = _message_text(payload.get("content"), "output_text")
-                if text:
-                    fallback_answers.append(
+                if turns and text:
+                    turns[-1].fallback_answers.append(
                         ChatMessage("assistant", text, timestamp, sequence)
                     )
                     sequence += 1
@@ -188,9 +208,10 @@ def _parse_rollout_with_status(
     if not isinstance(thread_id, str) or not thread_id.strip():
         return _ParseOutcome(None, "invalid", malformed_lines)
 
-    has_final_event = any(message.role == "assistant" for message in visible_messages)
-    if not has_final_event:
-        visible_messages.extend(fallback_answers)
+    visible_messages: List[ChatMessage] = []
+    for turn in turns:
+        visible_messages.append(turn.user_message)
+        visible_messages.extend(turn.final_answers or turn.fallback_answers)
     visible_messages.sort(key=lambda message: (message.timestamp, message.sequence))
 
     meta_timestamp = _parse_timestamp(meta.get("timestamp"))
