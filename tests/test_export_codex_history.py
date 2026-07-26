@@ -105,8 +105,8 @@ class RolloutParsingTests(unittest.TestCase):
                     },
                     user_row(),
                     agent_event_row("过程说明", phase="commentary"),
-                    agent_response_row("最终回答"),
-                    agent_event_row("最终回答"),
+                    agent_response_row("最终回答\n\n## 回答小节"),
+                    agent_event_row("最终回答\n\n## 回答小节"),
                     {
                         "timestamp": "2026-07-19T01:03:00Z",
                         "type": "event_msg",
@@ -120,12 +120,14 @@ class RolloutParsingTests(unittest.TestCase):
             self.assertIsNotNone(conversation)
             self.assertEqual(
                 [(message.role, message.text) for message in conversation.messages],
-                [("user", "用户问题"), ("assistant", "最终回答")],
+                [("user", "用户问题"), ("assistant", "最终回答\n\n## 回答小节")],
             )
             markdown = exporter.render_markdown(conversation, "会话标题", "Alpha")
             self.assertIn("# 会话标题", markdown)
-            self.assertIn("## User\n\n用户问题", markdown)
-            self.assertIn("## Codex\n\n最终回答", markdown)
+            self.assertIn("\n# User\n\n用户问题", markdown)
+            self.assertIn("\n# Codex\n\n最终回答\n\n## 回答小节", markdown)
+            self.assertNotIn("\n## User\n\n", markdown)
+            self.assertNotIn("\n## Codex\n\n", markdown)
             self.assertNotIn("内部提示", markdown)
             self.assertNotIn("过程说明", markdown)
             self.assertNotIn("隐藏推理", markdown)

@@ -465,7 +465,7 @@ def render_markdown(
         lines.extend(
             [
                 "",
-                "## User" if message.role == "user" else "## Codex",
+                "# User" if message.role == "user" else "# Codex",
                 "",
                 message.text.rstrip(),
             ]
