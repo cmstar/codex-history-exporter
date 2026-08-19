@@ -21,6 +21,9 @@ INVALID_COMPONENT_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 WINDOWS_RESERVED_NAMES = re.compile(
     r"^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$", re.IGNORECASE
 )
+CODEX_THREAD_DEEP_LINK = re.compile(
+    r"codex://threads/([^/?#]+)", re.IGNORECASE
+)
 
 
 @dataclass(frozen=True)
@@ -69,6 +72,20 @@ class _ConversationTurn:
     user_message: ChatMessage
     final_answers: List[ChatMessage]
     fallback_answers: List[ChatMessage]
+
+
+def _normalize_session_selector(value: str) -> str:
+    candidate = value.strip()
+    if not candidate:
+        raise ValueError("session ID or Codex deep link cannot be empty")
+    if not candidate.casefold().startswith("codex://"):
+        return candidate
+    match = CODEX_THREAD_DEEP_LINK.fullmatch(candidate)
+    if match is None:
+        raise ValueError(
+            "invalid Codex thread deep link; expected codex://threads/<session-id>"
+        )
+    return match.group(1)
 
 
 def _parse_timestamp(value: object) -> Optional[datetime]:
@@ -630,9 +647,7 @@ def export_history(
     if not codex_home.is_dir():
         raise FileNotFoundError("Codex home does not exist: {}".format(codex_home))
     if session_id is not None:
-        session_id = session_id.strip()
-        if not session_id:
-            raise ValueError("session ID cannot be empty")
+        session_id = _normalize_session_selector(session_id)
 
     rollouts = _discover_rollouts(codex_home)
     titles = load_titles(codex_home)
@@ -747,8 +762,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "session_id",
         nargs="?",
-        metavar="SESSION_ID",
-        help="export only the main session whose ID exactly matches SESSION_ID",
+        metavar="SESSION_ID_OR_DEEP_LINK",
+        help="export only the main session selected by its ID or Codex thread deep link",
     )
     parser.add_argument(
         "--codex-home",
@@ -768,12 +783,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--session-id",
         dest="named_session_id",
-        metavar="ID",
-        help="named form of the optional SESSION_ID positional argument",
+        metavar="ID_OR_DEEP_LINK",
+        help="named form of the optional session ID or Codex thread deep link",
     )
     arguments = parser.parse_args(argv)
     if arguments.session_id is not None and arguments.named_session_id is not None:
-        parser.error("SESSION_ID and --session-id cannot be used together")
+        parser.error("SESSION_ID_OR_DEEP_LINK and --session-id cannot be used together")
     session_id = arguments.named_session_id or arguments.session_id
     try:
         output_root = _absolute_without_resolving(

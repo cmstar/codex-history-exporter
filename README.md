@@ -28,19 +28,31 @@ python ./export_codex_history.py
 python ./export_codex_history.py --codex-home ~/Backup/.codex
 ```
 
-默认会导出所有主会话。若只想导出一个会话，可以传入完整的 session ID：
+默认会导出所有主会话。若只想导出一个会话，支持以下两种筛选值：
+
+1. 完整的 session ID
+2. Codex 的 **Copy deep link** 结果
+
+通过 session ID 导出：
 
 ```powershell
 python ./export_codex_history.py "019c1234-5678-7abc-9def-0123456789ab"
 ```
 
-也可以继续使用具名参数写法：
+通过 deep link 导出：
+
+```powershell
+python ./export_codex_history.py "codex://threads/019c1234-5678-7abc-9def-0123456789ab"
+```
+
+两种值也都支持 `--session-id` 具名参数写法：
 
 ```powershell
 python ./export_codex_history.py --session-id "019c1234-5678-7abc-9def-0123456789ab"
+python ./export_codex_history.py --session-id "codex://threads/019c1234-5678-7abc-9def-0123456789ab"
 ```
 
-脚本会按 session 元数据中的 ID 进行完全匹配。单个会话导出时不会生成全量导出使用的 `projects.toml`。找不到该 ID、会话属于 sub-agent，或会话没有可导出的消息时，脚本会返回错误且不会替换已有输出。
+对于 session ID，脚本会直接按 session 元数据中的 ID 进行完全匹配；对于 deep link，脚本会先从 `codex://threads/<session-id>` 中提取 session ID，再执行相同的完全匹配。单个会话导出时不会生成全量导出使用的 `projects.toml`。deep link 格式无效、找不到该 ID、会话属于 sub-agent，或会话没有可导出的消息时，脚本会返回错误且不会替换已有输出。
 
 如果曾编辑用户消息并生成多个版本，导出结果只保留最终有效分支；被后续编辑回滚的旧问题、旧回答及其后续分支不会写入 Markdown。
 

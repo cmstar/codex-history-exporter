@@ -86,6 +86,23 @@ def conversation_stub(thread_id, cwd):
     )
 
 
+class SessionSelectorTests(unittest.TestCase):
+    def test_keeps_a_plain_session_id(self):
+        self.assertEqual(
+            exporter._normalize_session_selector("  thread-one  "), "thread-one"
+        )
+
+    def test_extracts_session_id_from_codex_thread_deep_link(self):
+        self.assertEqual(
+            exporter._normalize_session_selector("codex://threads/thread-two"),
+            "thread-two",
+        )
+
+    def test_rejects_a_malformed_codex_deep_link(self):
+        with self.assertRaisesRegex(ValueError, "expected codex://threads"):
+            exporter._normalize_session_selector("codex://thread/thread-two")
+
+
 class RolloutParsingTests(unittest.TestCase):
     def test_extracts_only_user_messages_and_final_answers(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -508,6 +525,31 @@ class EndToEndTests(unittest.TestCase):
                 [
                     "--session-id",
                     "thread-two",
+                    "--codex-home",
+                    str(codex_home),
+                    "--output",
+                    str(output),
+                ]
+            )
+
+            files = list(output.rglob("*.md"))
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(len(files), 1)
+            self.assertFalse((output / "projects.toml").exists())
+            self.assertIn(
+                "Thread ID: `thread-two`",
+                files[0].read_text(encoding="utf-8"),
+            )
+
+    def test_cli_accepts_a_codex_thread_deep_link(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            codex_home = self.make_codex_home(root)
+            output = root / "selected-output"
+
+            exit_code = exporter.main(
+                [
+                    "codex://threads/thread-two",
                     "--codex-home",
                     str(codex_home),
                     "--output",
