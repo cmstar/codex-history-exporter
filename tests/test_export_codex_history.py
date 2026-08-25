@@ -67,6 +67,39 @@ def agent_response_row(text="回退回答", timestamp="2026-07-19T01:02:00Z"):
     }
 
 
+def completed_user_item_row(text="用户问题", timestamp="2026-07-19T01:01:00Z"):
+    return {
+        "timestamp": timestamp,
+        "type": "event_msg",
+        "payload": {
+            "type": "item_completed",
+            "item": {
+                "type": "UserMessage",
+                "id": "user-item",
+                "content": {"type": "text", "text": text},
+            },
+        },
+    }
+
+
+def completed_agent_item_row(
+    text="最终回答", phase="final_answer", timestamp="2026-07-19T01:02:00Z"
+):
+    return {
+        "timestamp": timestamp,
+        "type": "event_msg",
+        "payload": {
+            "type": "item_completed",
+            "item": {
+                "type": "AgentMessage",
+                "id": "agent-item",
+                "content": {"type": "Text", "text": text},
+                "phase": phase,
+            },
+        },
+    }
+
+
 def rollback_row(num_turns=1, timestamp="2026-07-19T01:03:00Z"):
     return {
         "timestamp": timestamp,
@@ -148,6 +181,109 @@ class RolloutParsingTests(unittest.TestCase):
             self.assertNotIn("内部提示", markdown)
             self.assertNotIn("过程说明", markdown)
             self.assertNotIn("隐藏推理", markdown)
+
+    def test_extracts_current_item_completed_messages(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "rollout.jsonl"
+            write_jsonl(
+                path,
+                [
+                    meta_row(),
+                    {
+                        "timestamp": "2026-07-19T01:00:30Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": "内部环境上下文"}
+                            ],
+                        },
+                    },
+                    completed_user_item_row("新格式问题"),
+                    completed_agent_item_row("过程说明", phase="commentary"),
+                    agent_response_row("新格式回答"),
+                    completed_agent_item_row("新格式回答"),
+                ],
+            )
+
+            conversation = exporter.parse_rollout(path)
+
+            self.assertEqual(
+                [(message.role, message.text) for message in conversation.messages],
+                [("user", "新格式问题"), ("assistant", "新格式回答")],
+            )
+
+    def test_extracts_documented_app_server_item_shape(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "rollout.jsonl"
+            write_jsonl(
+                path,
+                [
+                    meta_row(),
+                    {
+                        "timestamp": "2026-07-19T01:01:00Z",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "item_completed",
+                            "item": {
+                                "type": "userMessage",
+                                "id": "user-item",
+                                "content": [
+                                    {"type": "text", "text": "官方结构问题"}
+                                ],
+                            },
+                        },
+                    },
+                    {
+                        "timestamp": "2026-07-19T01:02:00Z",
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "item_completed",
+                            "item": {
+                                "type": "agentMessage",
+                                "id": "agent-item",
+                                "text": "官方结构回答",
+                                "phase": "final_answer",
+                            },
+                        },
+                    },
+                ],
+            )
+
+            conversation = exporter.parse_rollout(path)
+
+            self.assertEqual(
+                [(message.role, message.text) for message in conversation.messages],
+                [("user", "官方结构问题"), ("assistant", "官方结构回答")],
+            )
+
+    def test_deduplicates_legacy_and_completed_item_messages(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "rollout.jsonl"
+            write_jsonl(
+                path,
+                [
+                    meta_row(),
+                    user_row("重复问题", "2026-07-19T01:01:00.000Z"),
+                    completed_user_item_row(
+                        "重复问题", "2026-07-19T01:01:00.050Z"
+                    ),
+                    agent_event_row(
+                        "重复回答", timestamp="2026-07-19T01:02:00.000Z"
+                    ),
+                    completed_agent_item_row(
+                        "重复回答", timestamp="2026-07-19T01:02:00.050Z"
+                    ),
+                ],
+            )
+
+            conversation = exporter.parse_rollout(path)
+
+            self.assertEqual(
+                [(message.role, message.text) for message in conversation.messages],
+                [("user", "重复问题"), ("assistant", "重复回答")],
+            )
 
     def test_excludes_subagent_rollouts(self):
         with tempfile.TemporaryDirectory() as temp:

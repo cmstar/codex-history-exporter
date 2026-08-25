@@ -24,6 +24,7 @@ WINDOWS_RESERVED_NAMES = re.compile(
 CODEX_THREAD_DEEP_LINK = re.compile(
     r"codex://threads/([^/?#]+)", re.IGNORECASE
 )
+DUPLICATE_EVENT_WINDOW_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -72,6 +73,8 @@ class _ConversationTurn:
     user_message: ChatMessage
     final_answers: List[ChatMessage]
     fallback_answers: List[ChatMessage]
+    user_sources: Set[str]
+    final_answer_sources: List[Set[str]]
 
 
 def _normalize_session_selector(value: str) -> str:
@@ -103,17 +106,84 @@ def _parse_timestamp(value: object) -> Optional[datetime]:
     return parsed
 
 
-def _message_text(content: object, expected_type: str) -> str:
-    if not isinstance(content, list):
+def _content_text(content: object, expected_types: Set[str]) -> str:
+    if isinstance(content, dict):
+        items = [content]
+    elif isinstance(content, list):
+        items = content
+    else:
         return ""
     parts = []
-    for item in content:
-        if not isinstance(item, dict) or item.get("type") != expected_type:
+    normalized_types = {value.casefold() for value in expected_types}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if (
+            not isinstance(item_type, str)
+            or item_type.casefold() not in normalized_types
+        ):
             continue
         text = item.get("text")
         if isinstance(text, str) and text.strip():
             parts.append(text)
     return "\n\n".join(parts)
+
+
+def _message_text(content: object, expected_type: str) -> str:
+    return _content_text(content, {expected_type})
+
+
+def _completed_item_type(item: dict) -> str:
+    value = item.get("type")
+    if not isinstance(value, str):
+        return ""
+    return re.sub(r"[^a-z0-9]", "", value.casefold())
+
+
+def _completed_item_text(item: dict) -> str:
+    text = item.get("text")
+    if isinstance(text, str) and text.strip():
+        return text
+    return _content_text(item.get("content"), {"text", "input_text", "output_text"})
+
+
+def _same_nearby_message(left: ChatMessage, right: ChatMessage) -> bool:
+    return (
+        left.text == right.text
+        and abs((left.timestamp - right.timestamp).total_seconds())
+        <= DUPLICATE_EVENT_WINDOW_SECONDS
+    )
+
+
+def _append_user_turn(
+    turns: List[_ConversationTurn], message: ChatMessage, source: str
+) -> bool:
+    if turns:
+        latest = turns[-1]
+        if (
+            source not in latest.user_sources
+            and not latest.final_answers
+            and not latest.fallback_answers
+            and _same_nearby_message(latest.user_message, message)
+        ):
+            latest.user_sources.add(source)
+            return False
+    turns.append(_ConversationTurn(message, [], [], {source}, []))
+    return True
+
+
+def _append_final_answer(
+    turn: _ConversationTurn, message: ChatMessage, source: str
+) -> bool:
+    for index, existing in enumerate(turn.final_answers):
+        sources = turn.final_answer_sources[index]
+        if source not in sources and _same_nearby_message(existing, message):
+            sources.add(source)
+            return False
+    turn.final_answers.append(message)
+    turn.final_answer_sources.append({source})
+    return True
 
 
 def _is_subagent(meta: dict) -> bool:
@@ -178,14 +248,30 @@ def _parse_rollout_with_status(
             if row_type == "event_msg" and payload.get("type") == "user_message":
                 text = payload.get("message")
                 if isinstance(text, str) and text.strip():
-                    turns.append(
-                        _ConversationTurn(
-                            ChatMessage("user", text, timestamp, sequence),
-                            [],
-                            [],
-                        )
-                    )
-                    sequence += 1
+                    message = ChatMessage("user", text, timestamp, sequence)
+                    if _append_user_turn(turns, message, "legacy_event"):
+                        sequence += 1
+                continue
+
+            if row_type == "event_msg" and payload.get("type") == "item_completed":
+                item = payload.get("item")
+                if not isinstance(item, dict):
+                    continue
+                item_type = _completed_item_type(item)
+                text = _completed_item_text(item)
+                if item_type == "usermessage" and text:
+                    message = ChatMessage("user", text, timestamp, sequence)
+                    if _append_user_turn(turns, message, "completed_item"):
+                        sequence += 1
+                elif (
+                    item_type == "agentmessage"
+                    and item.get("phase") == "final_answer"
+                    and turns
+                    and text
+                ):
+                    message = ChatMessage("assistant", text, timestamp, sequence)
+                    if _append_final_answer(turns[-1], message, "completed_item"):
+                        sequence += 1
                 continue
 
             if (
@@ -195,10 +281,9 @@ def _parse_rollout_with_status(
             ):
                 text = payload.get("message")
                 if turns and isinstance(text, str) and text.strip():
-                    turns[-1].final_answers.append(
-                        ChatMessage("assistant", text, timestamp, sequence)
-                    )
-                    sequence += 1
+                    message = ChatMessage("assistant", text, timestamp, sequence)
+                    if _append_final_answer(turns[-1], message, "legacy_event"):
+                        sequence += 1
                 continue
 
             if (
