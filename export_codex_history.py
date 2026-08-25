@@ -56,6 +56,9 @@ class ExportSummary:
     discovered: int
     exported: int
     excluded_subagents: int
+    duplicate_rollouts: int
+    empty_sessions: int
+    invalid_rollouts: int
     skipped: int
     malformed_lines: int
     output_root: Path
@@ -409,6 +412,34 @@ def load_titles(codex_home: Path) -> Dict[str, str]:
     return titles
 
 
+def _load_database_archived_states(codex_home: Path) -> Dict[str, bool]:
+    states: Dict[str, bool] = {}
+    databases = sorted(
+        codex_home.glob("state_*.sqlite"), key=_state_database_sort_key, reverse=True
+    )
+    if not databases:
+        return states
+    database_path = databases[0].resolve()
+    try:
+        connection = sqlite3.connect(database_path.as_uri() + "?mode=ro", uri=True)
+        try:
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(threads)")
+            }
+            if not {"id", "archived"}.issubset(columns):
+                return states
+            for thread_id, archived in connection.execute(
+                "SELECT id, archived FROM threads WHERE archived IS NOT NULL"
+            ):
+                if isinstance(thread_id, str) and isinstance(archived, (bool, int)):
+                    states[thread_id] = bool(archived)
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error) as error:
+        print("warning: cannot read {}: {}".format(database_path, error), file=sys.stderr)
+    return states
+
+
 def _normalize_path(value: object) -> Optional[str]:
     if not isinstance(value, str) or not value.strip() or value.strip() == "~":
         return None
@@ -627,6 +658,29 @@ def _discover_rollouts(codex_home: Path) -> List[Path]:
     return sorted(paths)
 
 
+def _duplicate_conversation_key(conversation: ParsedConversation) -> tuple:
+    """Identify rollouts that would export the same visible conversation."""
+    return (
+        conversation.thread_id,
+        conversation.cwd,
+        conversation.messages,
+        conversation.last_timestamp,
+    )
+
+
+def _prefer_duplicate_conversation(
+    current: ParsedConversation,
+    candidate: ParsedConversation,
+    archived_states: Dict[str, bool],
+) -> ParsedConversation:
+    archived = archived_states.get(current.thread_id)
+    if archived is not None and current.archived != candidate.archived:
+        return candidate if candidate.archived == archived else current
+    if current.archived != candidate.archived:
+        return current if current.archived else candidate
+    return min((current, candidate), key=lambda value: str(value.source_path).casefold())
+
+
 def _assert_not_symlink(path: Path) -> None:
     if path.is_symlink():
         raise RuntimeError("refusing to replace symbolic-link path: {}".format(path))
@@ -736,6 +790,7 @@ def export_history(
 
     rollouts = _discover_rollouts(codex_home)
     titles = load_titles(codex_home)
+    archived_states = _load_database_archived_states(codex_home)
     resolver = ProjectResolver.from_codex_home(codex_home)
     staging = output_root.with_name(output_root.name + ".__staging__")
     backup = output_root.with_name(output_root.name + ".__backup__")
@@ -744,11 +799,15 @@ def export_history(
 
     exported = 0
     excluded_subagents = 0
+    duplicate_rollouts = 0
+    empty_sessions = 0
+    invalid_rollouts = 0
     skipped = 0
     malformed_lines = 0
     matched_rollouts = 0
     allocated = set()
     project_paths: Dict[str, Set[str]] = {}
+    conversations: Dict[tuple, ParsedConversation] = {}
     try:
         for rollout in rollouts:
             outcome = _parse_rollout_with_status(rollout, session_id)
@@ -762,8 +821,23 @@ def export_history(
                 continue
             conversation = outcome.conversation
             if conversation is None or outcome.status != "ok":
+                if outcome.status == "empty":
+                    empty_sessions += 1
+                else:
+                    invalid_rollouts += 1
                 skipped += 1
                 continue
+            duplicate_key = _duplicate_conversation_key(conversation)
+            existing = conversations.get(duplicate_key)
+            if existing is not None:
+                duplicate_rollouts += 1
+                conversations[duplicate_key] = _prefer_duplicate_conversation(
+                    existing, conversation, archived_states
+                )
+                continue
+            conversations[duplicate_key] = conversation
+
+        for conversation in conversations.values():
             title = _conversation_title(conversation, titles)
             resolved_project = resolver.resolve_with_path(conversation)
             project = resolved_project.name
@@ -803,6 +877,9 @@ def export_history(
         discovered=len(rollouts),
         exported=exported,
         excluded_subagents=excluded_subagents,
+        duplicate_rollouts=duplicate_rollouts,
+        empty_sessions=empty_sessions,
+        invalid_rollouts=invalid_rollouts,
         skipped=skipped,
         malformed_lines=malformed_lines,
         output_root=output_root,
@@ -896,6 +973,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print("  discovered: {}".format(summary.discovered))
     print("  exported: {}".format(summary.exported))
     print("  sub-agents excluded: {}".format(summary.excluded_subagents))
+    print("  duplicate rollouts excluded: {}".format(summary.duplicate_rollouts))
+    print("  empty sessions: {}".format(summary.empty_sessions))
+    print("  invalid rollouts: {}".format(summary.invalid_rollouts))
     print("  skipped: {}".format(summary.skipped))
     print("  malformed JSONL lines: {}".format(summary.malformed_lines))
     print("  output: {}".format(summary.output_root))

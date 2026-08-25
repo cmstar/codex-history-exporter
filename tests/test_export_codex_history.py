@@ -573,6 +573,98 @@ class EndToEndTests(unittest.TestCase):
                 )
                 self.assertEqual(index["Alpha"]["Path"], r"C:\Work\Alpha")
 
+    def test_export_deduplicates_identical_rollouts_by_thread_id(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            codex_home = self.make_codex_home(root)
+            duplicate_rows = [
+                meta_row("thread-one"),
+                user_row("问题一"),
+                agent_event_row("回答一"),
+            ]
+            write_jsonl(
+                codex_home / "archived_sessions" / "thread-one.jsonl",
+                duplicate_rows,
+            )
+            database = sqlite3.connect(codex_home / "state_1.sqlite")
+            try:
+                database.execute(
+                    "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, archived INTEGER)"
+                )
+                database.execute(
+                    "INSERT INTO threads (id, title, archived) VALUES (?, ?, ?)",
+                    ("thread-one", "相同标题", 0),
+                )
+                database.commit()
+            finally:
+                database.close()
+            output = root / "output"
+
+            summary = exporter.export_history(codex_home, output)
+
+            files = list(output.rglob("*.md"))
+            thread_one = [
+                path
+                for path in files
+                if "Thread ID: `thread-one`" in path.read_text(encoding="utf-8")
+            ]
+            self.assertEqual(summary.discovered, 4)
+            self.assertEqual(summary.exported, 2)
+            self.assertEqual(summary.duplicate_rollouts, 1)
+            self.assertEqual(len(files), 2)
+            self.assertEqual(len(thread_one), 1)
+            self.assertIn("- Archived: `false`", thread_one[0].read_text(encoding="utf-8"))
+
+    def test_export_preserves_divergent_rollouts_with_the_same_thread_id(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            codex_home = self.make_codex_home(root)
+            write_jsonl(
+                codex_home / "archived_sessions" / "thread-one.jsonl",
+                [
+                    meta_row("thread-one"),
+                    user_row("不同分支"),
+                    agent_event_row("不同回答"),
+                ],
+            )
+            output = root / "output"
+
+            summary = exporter.export_history(codex_home, output)
+
+            files = list(output.rglob("*.md"))
+            thread_one = [
+                path
+                for path in files
+                if "Thread ID: `thread-one`" in path.read_text(encoding="utf-8")
+            ]
+            self.assertEqual(summary.exported, 3)
+            self.assertEqual(summary.duplicate_rollouts, 0)
+            self.assertEqual(len(thread_one), 2)
+            self.assertTrue(
+                any("问题一" in path.read_text(encoding="utf-8") for path in thread_one)
+            )
+            self.assertTrue(
+                any("不同分支" in path.read_text(encoding="utf-8") for path in thread_one)
+            )
+
+    def test_export_reports_empty_and_invalid_rollouts_separately(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            codex_home = self.make_codex_home(root)
+            sessions = codex_home / "sessions" / "2026" / "07" / "19"
+            write_jsonl(sessions / "empty.jsonl", [meta_row("thread-empty")])
+            write_jsonl(
+                sessions / "invalid.jsonl",
+                [user_row("缺少 session_meta")],
+            )
+            output = root / "output"
+
+            summary = exporter.export_history(codex_home, output)
+
+            self.assertEqual(summary.empty_sessions, 1)
+            self.assertEqual(summary.invalid_rollouts, 1)
+            self.assertEqual(summary.skipped, 2)
+
     def test_export_can_select_one_session_by_exact_id(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

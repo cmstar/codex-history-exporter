@@ -93,6 +93,8 @@ Path = '''/home/user/Workspace/项目1'''
 
 确认覆盖后，每次执行都会完整重建目标目录。脚本先在 staging 目录生成全部文件，成功后才替换现有输出；生成阶段失败时会保留上一次的结果。如果输出根目录被占用而无法整体改名，脚本会自动改用带备份和回滚的目录内替换。
 
+脚本会同时扫描 `sessions` 与 `archived_sessions`。如果同一个 Thread ID 在两个目录中留下了可见对话完全相同的 rollout，只导出一份，并优先采用 Codex 状态数据库记录的归档状态；如果同一 Thread ID 的可见对话不同，则保留两份，避免静默丢失历史分支。命令行统计中的 `duplicate rollouts excluded` 会显示被排除的相同副本数量；`empty sessions` 与 `invalid rollouts` 会进一步说明 `skipped` 分别来自无可见消息的会话还是无有效会话元数据的记录。
+
 ## 项目判断规则
 
 脚本依次使用：
