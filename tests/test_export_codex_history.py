@@ -647,6 +647,74 @@ class EndToEndTests(unittest.TestCase):
                 any("不同分支" in path.read_text(encoding="utf-8") for path in thread_one)
             )
 
+    def test_export_can_ignore_archived_conversations(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            codex_home = self.make_codex_home(root)
+            write_jsonl(
+                codex_home / "archived_sessions" / "thread-three.jsonl",
+                [
+                    meta_row("thread-three"),
+                    user_row("归档问题"),
+                    agent_event_row("归档回答"),
+                ],
+            )
+            output = root / "output"
+
+            summary = exporter.export_history(
+                codex_home, output, ignore_archived=True
+            )
+
+            files = list(output.rglob("*.md"))
+            markdown = "\n".join(path.read_text(encoding="utf-8") for path in files)
+            self.assertEqual(summary.discovered, 4)
+            self.assertEqual(summary.exported, 2)
+            self.assertEqual(summary.ignored_archived, 1)
+            self.assertEqual(len(files), 2)
+            self.assertNotIn("Thread ID: `thread-three`", markdown)
+
+    def test_ignore_archived_prefers_the_database_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            codex_home = self.make_codex_home(root)
+            database = sqlite3.connect(codex_home / "state_1.sqlite")
+            try:
+                database.execute(
+                    "CREATE TABLE threads (id TEXT PRIMARY KEY, archived INTEGER)"
+                )
+                database.execute(
+                    "INSERT INTO threads (id, archived) VALUES (?, ?)",
+                    ("thread-one", 1),
+                )
+                database.commit()
+            finally:
+                database.close()
+            output = root / "output"
+
+            summary = exporter.export_history(
+                codex_home, output, ignore_archived=True
+            )
+
+            files = list(output.rglob("*.md"))
+            markdown = "\n".join(path.read_text(encoding="utf-8") for path in files)
+            self.assertEqual(summary.exported, 1)
+            self.assertEqual(summary.ignored_archived, 1)
+            self.assertNotIn("Thread ID: `thread-one`", markdown)
+            self.assertIn("Thread ID: `thread-two`", markdown)
+
+    def test_export_rejects_ignore_archived_for_one_session(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            codex_home = self.make_codex_home(root)
+
+            with self.assertRaisesRegex(ValueError, "only available for full exports"):
+                exporter.export_history(
+                    codex_home,
+                    root / "output",
+                    session_id="thread-one",
+                    ignore_archived=True,
+                )
+
     def test_export_reports_empty_and_invalid_rollouts_separately(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -793,6 +861,36 @@ class EndToEndTests(unittest.TestCase):
                 "Thread ID: `thread-two`",
                 files[0].read_text(encoding="utf-8"),
             )
+
+    def test_cli_can_ignore_archived_conversations_in_a_full_export(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            codex_home = self.make_codex_home(root)
+            write_jsonl(
+                codex_home / "archived_sessions" / "thread-three.jsonl",
+                [
+                    meta_row("thread-three"),
+                    user_row("归档问题"),
+                    agent_event_row("归档回答"),
+                ],
+            )
+            output = root / "output"
+
+            exit_code = exporter.main(
+                [
+                    "--ignore-archived",
+                    "--codex-home",
+                    str(codex_home),
+                    "--output",
+                    str(output),
+                ]
+            )
+
+            files = list(output.rglob("*.md"))
+            markdown = "\n".join(path.read_text(encoding="utf-8") for path in files)
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(len(files), 2)
+            self.assertNotIn("Thread ID: `thread-three`", markdown)
 
     def test_cli_declines_to_replace_a_nonempty_output_directory(self):
         with tempfile.TemporaryDirectory() as temp:

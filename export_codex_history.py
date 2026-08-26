@@ -56,6 +56,7 @@ class ExportSummary:
     discovered: int
     exported: int
     excluded_subagents: int
+    ignored_archived: int
     duplicate_rollouts: int
     empty_sessions: int
     invalid_rollouts: int
@@ -681,6 +682,12 @@ def _prefer_duplicate_conversation(
     return min((current, candidate), key=lambda value: str(value.source_path).casefold())
 
 
+def _conversation_is_archived(
+    conversation: ParsedConversation, archived_states: Dict[str, bool]
+) -> bool:
+    return archived_states.get(conversation.thread_id, conversation.archived)
+
+
 def _assert_not_symlink(path: Path) -> None:
     if path.is_symlink():
         raise RuntimeError("refusing to replace symbolic-link path: {}".format(path))
@@ -779,7 +786,10 @@ def _publish_staging(staging: Path, output_root: Path, backup: Path) -> None:
 
 
 def export_history(
-    codex_home: Path, output_root: Path, session_id: Optional[str] = None
+    codex_home: Path,
+    output_root: Path,
+    session_id: Optional[str] = None,
+    ignore_archived: bool = False,
 ) -> ExportSummary:
     codex_home = Path(codex_home).expanduser().resolve()
     output_root = _absolute_without_resolving(Path(output_root).expanduser())
@@ -787,6 +797,8 @@ def export_history(
         raise FileNotFoundError("Codex home does not exist: {}".format(codex_home))
     if session_id is not None:
         session_id = _normalize_session_selector(session_id)
+    if session_id is not None and ignore_archived:
+        raise ValueError("ignore_archived is only available for full exports")
 
     rollouts = _discover_rollouts(codex_home)
     titles = load_titles(codex_home)
@@ -799,6 +811,7 @@ def export_history(
 
     exported = 0
     excluded_subagents = 0
+    ignored_archived = 0
     duplicate_rollouts = 0
     empty_sessions = 0
     invalid_rollouts = 0
@@ -838,6 +851,11 @@ def export_history(
             conversations[duplicate_key] = conversation
 
         for conversation in conversations.values():
+            if ignore_archived and _conversation_is_archived(
+                conversation, archived_states
+            ):
+                ignored_archived += 1
+                continue
             title = _conversation_title(conversation, titles)
             resolved_project = resolver.resolve_with_path(conversation)
             project = resolved_project.name
@@ -877,6 +895,7 @@ def export_history(
         discovered=len(rollouts),
         exported=exported,
         excluded_subagents=excluded_subagents,
+        ignored_archived=ignored_archived,
         duplicate_rollouts=duplicate_rollouts,
         empty_sessions=empty_sessions,
         invalid_rollouts=invalid_rollouts,
@@ -943,6 +962,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="replace a nonempty output directory without prompting",
     )
     parser.add_argument(
+        "--ignore-archived",
+        action="store_true",
+        help="exclude archived conversations from a full export",
+    )
+    parser.add_argument(
         "--session-id",
         dest="named_session_id",
         metavar="ID_OR_DEEP_LINK",
@@ -952,6 +976,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if arguments.session_id is not None and arguments.named_session_id is not None:
         parser.error("SESSION_ID_OR_DEEP_LINK and --session-id cannot be used together")
     session_id = arguments.named_session_id or arguments.session_id
+    if session_id is not None and arguments.ignore_archived:
+        parser.error("--ignore-archived cannot be used with a session selector")
     try:
         output_root = _absolute_without_resolving(
             Path(arguments.output).expanduser()
@@ -965,6 +991,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _default_codex_home(arguments.codex_home),
             output_root,
             session_id=session_id,
+            ignore_archived=arguments.ignore_archived,
         )
     except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
         print("error: {}".format(error), file=sys.stderr)
@@ -973,6 +1000,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print("  discovered: {}".format(summary.discovered))
     print("  exported: {}".format(summary.exported))
     print("  sub-agents excluded: {}".format(summary.excluded_subagents))
+    print("  archived conversations ignored: {}".format(summary.ignored_archived))
     print("  duplicate rollouts excluded: {}".format(summary.duplicate_rollouts))
     print("  empty sessions: {}".format(summary.empty_sessions))
     print("  invalid rollouts: {}".format(summary.invalid_rollouts))
