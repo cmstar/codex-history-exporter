@@ -64,6 +64,46 @@ python ./export_codex_history.py --ignore-archived
 
 如果曾编辑用户消息并生成多个版本，导出结果只保留最终有效分支；被后续编辑回滚的旧问题、旧回答及其后续分支不会写入 Markdown。
 
+### 按创建时间或最后聊天时间筛选
+
+批量导出支持四个时间筛选参数：
+
+| 参数 | 含义 |
+| --- | --- |
+| `--created-since TIME` | 创建时间的下限 |
+| `--created-until TIME` | 创建时间的上限 |
+| `--last-chat-since TIME` | 最后聊天时间的下限 |
+| `--last-chat-until TIME` | 最后聊天时间的上限 |
+
+`TIME` 只接受以下三种纯数字格式，均按运行脚本的电脑本地时区解释：
+
+| 格式 | 示例 | 精度 |
+| --- | --- | --- |
+| `yyyyMMdd` | `20260906` | 日 |
+| `yyyyMMddHHmm` | `202609061430` | 分钟 |
+| `yyyyMMddHHmmss` | `20260906143025` | 秒 |
+
+下限包含指定时刻；上限包含指定的整天、整分钟或整秒。例如 `--last-chat-until 20260906` 包含当天全部消息时间，`--last-chat-until 202609061430` 包含到 `14:30:59.999999`，`--last-chat-until 20260906143025` 包含到 `14:30:25.999999`。
+
+四个参数都可以单独使用，也可以混用不同精度。多个条件之间是“同时满足”的关系；同一组的起止范围不能颠倒。没有传入时间参数时，保持全量导出。可以与 `--ignore-archived` 组合使用。
+
+```powershell
+# 导出最后聊天日期在 8 月 31 日至 9 月 6 日这一周内的对话
+python ./export_codex_history.py --last-chat-since 20260831 --last-chat-until 20260906
+
+# 导出 9 月 6 日 14:30 至 15:00:25（包含该秒）创建的对话
+python ./export_codex_history.py --created-since 202609061430 --created-until 20260906150025
+
+# 导出 9 月以前创建、9 月 1 日及以后仍有聊天的未归档对话
+python ./export_codex_history.py --created-until 20260831 --last-chat-since 20260901 --ignore-archived
+```
+
+筛选单位是整个对话，命中的对话仍导出完整的有效历史，不会截取日期范围内的消息。“最后聊天时间”是最终有效分支中最后一条用户消息或 Codex 最终回复的时间，不包含工具事件或已回滚的旧消息。如果对话在 9 月 3 日聊过、9 月 8 日又继续聊，那么 `--last-chat-until 20260906` 会排除它。
+
+创建时间来自会话元数据中的 `timestamp`。如果所需的创建时间缺失或无效，或者按最后聊天时间筛选时有可见消息缺失有效时间，脚本会跳过该对话，并在 `conversations missing filter timestamps` 中计数，不使用文件修改时间代替筛选时间。正常超出范围的对话计入 `conversations outside date filters`。
+
+指定单个 session ID 或 deep link 时，四个时间参数全部忽略，包括其取值格式和范围校验，仍导出该会话的完整有效历史。批量导出时，非法时间或颠倒的范围会在覆盖确认前报错，保留已有输出。筛选结果为零时，成功导出空的项目索引；已有非空输出仍遵循下方的覆盖确认规则。
+
 默认结果写入运行命令时所在目录的 `output` 子目录：
 
 ```text

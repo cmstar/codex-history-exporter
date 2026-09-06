@@ -12,7 +12,7 @@ import shutil
 import sqlite3
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -33,6 +33,7 @@ class ChatMessage:
     text: str
     timestamp: datetime
     sequence: int
+    timestamp_known: bool = True
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,7 @@ class ParsedConversation:
     messages: Tuple[ChatMessage, ...]
     last_timestamp: datetime
     archived: bool
+    created_timestamp: Optional[datetime] = None
 
 
 @dataclass(frozen=True)
@@ -63,6 +65,67 @@ class ExportSummary:
     skipped: int
     malformed_lines: int
     output_root: Path
+    date_filtered: int = 0
+    missing_filter_timestamps: int = 0
+
+
+@dataclass(frozen=True)
+class _TimeRange:
+    since: Optional[datetime]
+    until: Optional[datetime]  # Exclusive upper bound.
+
+    @property
+    def active(self) -> bool:
+        return self.since is not None or self.until is not None
+
+    def contains(self, timestamp: datetime) -> bool:
+        return (self.since is None or timestamp >= self.since) and (
+            self.until is None or timestamp < self.until
+        )
+
+
+def _parse_filter_time(value: str, option: str, upper: bool = False) -> datetime:
+    formats = {
+        8: ("%Y%m%d", timedelta(days=1)),
+        12: ("%Y%m%d%H%M", timedelta(minutes=1)),
+        14: ("%Y%m%d%H%M%S", timedelta(seconds=1)),
+    }
+    try:
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9]{8}|[0-9]{12}|[0-9]{14}", value):
+            raise ValueError("invalid format")
+        pattern, precision = formats[len(value)]
+        local_time = datetime.strptime(value, pattern)
+        if upper:
+            local_time += precision
+        # Interpret each boundary in the system's local timezone, including DST.
+        return local_time.astimezone(timezone.utc)
+    except (ValueError, OverflowError, OSError) as error:
+        raise ValueError(
+            "{}: expected a valid local time in yyyyMMdd, yyyyMMddHHmm, "
+            "or yyyyMMddHHmmss format: {!r}".format(option, value)
+        ) from error
+
+
+def _date_filters(
+    session_id: Optional[str],
+    created_since: Optional[str],
+    created_until: Optional[str],
+    last_chat_since: Optional[str],
+    last_chat_until: Optional[str],
+) -> Tuple[_TimeRange, _TimeRange]:
+    if session_id is not None:
+        return _TimeRange(None, None), _TimeRange(None, None)
+    ranges = []
+    for name, since, until in (
+        ("created", created_since, created_until),
+        ("last-chat", last_chat_since, last_chat_until),
+    ):
+        lower = _parse_filter_time(since, "--" + name + "-since") if since is not None else None
+        upper = _parse_filter_time(until, "--" + name + "-until", upper=True) if until is not None else None
+        if lower is not None and upper is not None and lower >= upper:
+            raise ValueError("--{}-since must not be later than --{}-until".format(name, name))
+        ranges.append(_TimeRange(lower, upper))
+    return ranges[0], ranges[1]
 
 
 @dataclass(frozen=True)
@@ -246,13 +309,14 @@ def _parse_rollout_with_status(
                 continue
 
             timestamp = _parse_timestamp(row.get("timestamp"))
+            timestamp_known = timestamp is not None
             if timestamp is None:
                 timestamp = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
 
             if row_type == "event_msg" and payload.get("type") == "user_message":
                 text = payload.get("message")
                 if isinstance(text, str) and text.strip():
-                    message = ChatMessage("user", text, timestamp, sequence)
+                    message = ChatMessage("user", text, timestamp, sequence, timestamp_known)
                     if _append_user_turn(turns, message, "legacy_event"):
                         sequence += 1
                 continue
@@ -264,7 +328,7 @@ def _parse_rollout_with_status(
                 item_type = _completed_item_type(item)
                 text = _completed_item_text(item)
                 if item_type == "usermessage" and text:
-                    message = ChatMessage("user", text, timestamp, sequence)
+                    message = ChatMessage("user", text, timestamp, sequence, timestamp_known)
                     if _append_user_turn(turns, message, "completed_item"):
                         sequence += 1
                 elif (
@@ -273,7 +337,7 @@ def _parse_rollout_with_status(
                     and turns
                     and text
                 ):
-                    message = ChatMessage("assistant", text, timestamp, sequence)
+                    message = ChatMessage("assistant", text, timestamp, sequence, timestamp_known)
                     if _append_final_answer(turns[-1], message, "completed_item"):
                         sequence += 1
                 continue
@@ -285,7 +349,7 @@ def _parse_rollout_with_status(
             ):
                 text = payload.get("message")
                 if turns and isinstance(text, str) and text.strip():
-                    message = ChatMessage("assistant", text, timestamp, sequence)
+                    message = ChatMessage("assistant", text, timestamp, sequence, timestamp_known)
                     if _append_final_answer(turns[-1], message, "legacy_event"):
                         sequence += 1
                 continue
@@ -299,7 +363,7 @@ def _parse_rollout_with_status(
                 text = _message_text(payload.get("content"), "output_text")
                 if turns and text:
                     turns[-1].fallback_answers.append(
-                        ChatMessage("assistant", text, timestamp, sequence)
+                        ChatMessage("assistant", text, timestamp, sequence, timestamp_known)
                     )
                     sequence += 1
 
@@ -335,6 +399,7 @@ def _parse_rollout_with_status(
         messages=tuple(visible_messages),
         last_timestamp=last_timestamp,
         archived="archived_sessions" in path.parts,
+        created_timestamp=meta_timestamp,
     )
     status = "ok" if visible_messages else "empty"
     return _ParseOutcome(conversation, status, malformed_lines)
@@ -790,7 +855,14 @@ def export_history(
     output_root: Path,
     session_id: Optional[str] = None,
     ignore_archived: bool = False,
+    created_since: Optional[str] = None,
+    created_until: Optional[str] = None,
+    last_chat_since: Optional[str] = None,
+    last_chat_until: Optional[str] = None,
 ) -> ExportSummary:
+    created_range, last_chat_range = _date_filters(
+        session_id, created_since, created_until, last_chat_since, last_chat_until
+    )
     codex_home = Path(codex_home).expanduser().resolve()
     output_root = _absolute_without_resolving(Path(output_root).expanduser())
     if not codex_home.is_dir():
@@ -818,6 +890,8 @@ def export_history(
     skipped = 0
     malformed_lines = 0
     matched_rollouts = 0
+    date_filtered = 0
+    missing_filter_timestamps = 0
     allocated = set()
     project_paths: Dict[str, Set[str]] = {}
     conversations: Dict[tuple, ParsedConversation] = {}
@@ -855,6 +929,23 @@ def export_history(
                 conversation, archived_states
             ):
                 ignored_archived += 1
+                continue
+            if (
+                created_range.active and conversation.created_timestamp is None
+            ) or (
+                last_chat_range.active
+                and not all(message.timestamp_known for message in conversation.messages)
+            ):
+                missing_filter_timestamps += 1
+                continue
+            if (
+                created_range.active
+                and not created_range.contains(conversation.created_timestamp)
+            ) or (
+                last_chat_range.active
+                and not last_chat_range.contains(conversation.last_timestamp)
+            ):
+                date_filtered += 1
                 continue
             title = _conversation_title(conversation, titles)
             resolved_project = resolver.resolve_with_path(conversation)
@@ -902,6 +993,8 @@ def export_history(
         skipped=skipped,
         malformed_lines=malformed_lines,
         output_root=output_root,
+        date_filtered=date_filtered,
+        missing_filter_timestamps=missing_filter_timestamps,
     )
 
 
@@ -972,6 +1065,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         metavar="ID_OR_DEEP_LINK",
         help="named form of the optional session ID or Codex thread deep link",
     )
+    for name in ("created", "last-chat"):
+        for boundary in ("since", "until"):
+            parser.add_argument(
+                "--{}-{}".format(name, boundary),
+                metavar="TIME",
+                help=(
+                    "{} {} (local yyyyMMdd / yyyyMMddHHmm / yyyyMMddHHmmss; "
+                    "inclusive at supplied precision; ignored for a single session)"
+                ).format(name, boundary),
+            )
     arguments = parser.parse_args(argv)
     if arguments.session_id is not None and arguments.named_session_id is not None:
         parser.error("SESSION_ID_OR_DEEP_LINK and --session-id cannot be used together")
@@ -979,6 +1082,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if session_id is not None and arguments.ignore_archived:
         parser.error("--ignore-archived cannot be used with a session selector")
     try:
+        _date_filters(
+            session_id, arguments.created_since, arguments.created_until,
+            arguments.last_chat_since, arguments.last_chat_until,
+        )
         output_root = _absolute_without_resolving(
             Path(arguments.output).expanduser()
             if arguments.output
@@ -992,6 +1099,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             output_root,
             session_id=session_id,
             ignore_archived=arguments.ignore_archived,
+            created_since=arguments.created_since,
+            created_until=arguments.created_until,
+            last_chat_since=arguments.last_chat_since,
+            last_chat_until=arguments.last_chat_until,
         )
     except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
         print("error: {}".format(error), file=sys.stderr)
@@ -1001,6 +1112,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print("  exported: {}".format(summary.exported))
     print("  sub-agents excluded: {}".format(summary.excluded_subagents))
     print("  archived conversations ignored: {}".format(summary.ignored_archived))
+    print("  conversations outside date filters: {}".format(summary.date_filtered))
+    print("  conversations missing filter timestamps: {}".format(summary.missing_filter_timestamps))
     print("  duplicate rollouts excluded: {}".format(summary.duplicate_rollouts))
     print("  empty sessions: {}".format(summary.empty_sessions))
     print("  invalid rollouts: {}".format(summary.invalid_rollouts))

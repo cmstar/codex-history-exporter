@@ -2,7 +2,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -946,6 +946,173 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertFalse((output / "stale.txt").exists())
             self.assertEqual(len(list(output.rglob("*.md"))), 2)
+
+
+class DateFilterTests(unittest.TestCase):
+    @staticmethod
+    def local_timestamp(value):
+        return datetime.fromisoformat(value).astimezone(timezone.utc).isoformat()
+
+    def write_conversation(self, home, thread_id, created, last, extra_rows=()):
+        meta = meta_row(thread_id)
+        meta["payload"]["timestamp"] = self.local_timestamp(created) if created else None
+        write_jsonl(
+            home / "sessions" / (thread_id + ".jsonl"),
+            [meta, user_row("早期问题", self.local_timestamp("2026-01-01T10:00:00")),
+             agent_event_row("完整回答", timestamp=self.local_timestamp(last)), *extra_rows],
+        )
+
+    def test_until_includes_entire_day_minute_or_second(self):
+        cases = [
+            ("20260906", "2026-09-06T00:00:00", "2026-09-06T23:59:59.999999", "2026-09-07T00:00:00"),
+            ("202609061230", "2026-09-06T12:30:00", "2026-09-06T12:30:59.999999", "2026-09-06T12:31:00"),
+            ("20260906123045", "2026-09-06T12:30:45", "2026-09-06T12:30:45.999999", "2026-09-06T12:30:46"),
+        ]
+        for value, start, end, outside in cases:
+            for field in ("created", "last_chat"):
+                with self.subTest(value=value, field=field), tempfile.TemporaryDirectory() as temp:
+                    home = Path(temp) / "home"
+                    before = (datetime.fromisoformat(start) - timedelta(microseconds=1)).isoformat()
+                    for thread_id, timestamp in (("before", before), ("start", start), ("end", end), ("outside", outside)):
+                        self.write_conversation(home, thread_id, timestamp, timestamp)
+                    output = Path(temp) / "output"
+                    summary = exporter.export_history(
+                        home, output, **{field + "_since": value, field + "_until": value}
+                    )
+                    self.assertEqual(summary.exported, 2)
+                    self.assertEqual(summary.date_filtered, 2)
+                    markdown = "\n".join(p.read_text(encoding="utf-8") for p in output.rglob("*.md"))
+                    self.assertIn("Thread ID: `start`", markdown)
+                    self.assertIn("Thread ID: `end`", markdown)
+                    self.assertIn("早期问题", markdown)
+
+    def test_all_four_filters_intersect_and_accept_mixed_precision(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            for thread_id, created, last in (
+                ("match", "2026-08-15T12:30:00", "2026-09-06T09:30:15"),
+                ("old", "2026-07-31T23:59:59", "2026-09-06T09:30:15"),
+                ("new", "2026-08-16T00:00:00", "2026-09-06T09:30:15"),
+                ("inactive", "2026-08-15T12:30:00", "2026-09-06T09:29:59"),
+                ("later", "2026-08-15T12:30:00", "2026-09-06T09:30:16"),
+            ):
+                self.write_conversation(home, thread_id, created, last)
+            output = Path(temp) / "output"
+            result = exporter.main([
+                "--codex-home", str(home), "-o", str(output),
+                "--created-since", "20260801", "--created-until", "202608151230",
+                "--last-chat-since", "202609060930", "--last-chat-until", "20260906093015",
+            ])
+            self.assertEqual(result, 0)
+            files = list(output.rglob("*.md"))
+            self.assertEqual(len(files), 1)
+            self.assertIn("Thread ID: `match`", files[0].read_text(encoding="utf-8"))
+
+    def test_each_filter_works_alone(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            self.write_conversation(home, "early", "2026-08-01T12:00:00", "2026-09-01T12:00:00")
+            self.write_conversation(home, "late", "2026-08-02T12:00:00", "2026-09-02T12:00:00")
+            for name, value, expected in (
+                ("created_since", "20260802", "late"),
+                ("created_until", "20260801", "early"),
+                ("last_chat_since", "20260902", "late"),
+                ("last_chat_until", "20260901", "early"),
+            ):
+                with self.subTest(name=name):
+                    output = Path(temp) / name
+                    summary = exporter.export_history(home, output, **{name: value})
+                    self.assertEqual(summary.exported, 1)
+                    file = next(output.rglob("*.md"))
+                    self.assertIn("Thread ID: `{}`".format(expected), file.read_text(encoding="utf-8"))
+
+    def test_rejects_invalid_dates_and_reversed_ranges_before_output_prompt(self):
+        invalid = ["2026-09-06", "202609", "2026090612", "20260230", "202609062400",
+                   "20260906123060", "２０２６０９０６", " 20260906", "20260906000000Z", ""]
+        cases = [["--created-since", value] for value in invalid]
+        cases.extend([
+            ["--created-since", "20260907", "--created-until", "20260906"],
+            ["--last-chat-since", "202609061231", "--last-chat-until", "20260906123059"],
+        ])
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "output"
+            output.mkdir()
+            saved = output / "keep.txt"
+            saved.write_text("keep", encoding="utf-8")
+            for args in cases:
+                with self.subTest(args=args), mock.patch("builtins.input", side_effect=AssertionError("must validate first")):
+                    self.assertEqual(exporter.main(["-o", str(output), *args]), 1)
+                    self.assertEqual(saved.read_text(encoding="utf-8"), "keep")
+            self.assertFalse(output.with_name("output.__staging__").exists())
+
+    def test_single_session_ignores_invalid_and_reversed_filters(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            self.write_conversation(home, "selected", "2026-08-01T12:00:00", "2026-09-01T12:00:00")
+            for selector in (["selected"], ["codex://threads/selected"], ["--session-id", "selected"], ["--session-id", "codex://threads/selected"]):
+                with self.subTest(selector=selector):
+                    output = Path(temp) / "output"
+                    result = exporter.main([
+                        *selector, "--codex-home", str(home), "-o", str(output), "-f",
+                        "--created-since", "invalid", "--created-until", "also-invalid",
+                        "--last-chat-since", "20260907", "--last-chat-until", "20260901",
+                    ])
+                    self.assertEqual(result, 0)
+                    self.assertEqual(len(list(output.rglob("*.md"))), 1)
+                    self.assertFalse((output / "projects.toml").exists())
+            summary = exporter.export_history(home, output, session_id="selected", created_since="invalid")
+            self.assertEqual(summary.exported, 1)
+
+    def test_rollbacks_and_tool_events_do_not_extend_last_chat(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            later = self.local_timestamp("2026-09-08T12:00:00")
+            self.write_conversation(home, "selected", "2026-08-01T12:00:00", "2026-09-06T12:00:00", [
+                user_row("撤回的问题", later), agent_event_row("撤回的回答", timestamp=later),
+                rollback_row(1, later),
+                {"type": "event_msg", "timestamp": later, "payload": {"type": "token_count"}},
+            ])
+            output = Path(temp) / "output"
+            summary = exporter.export_history(home, output, last_chat_since="20260906", last_chat_until="20260906")
+            self.assertEqual(summary.exported, 1)
+            markdown = next(output.rglob("*.md")).read_text(encoding="utf-8")
+            self.assertNotIn("撤回", markdown)
+
+    def test_missing_timestamps_are_counted_only_when_required(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            self.write_conversation(home, "unknown-created", None, "2026-09-06T12:00:00")
+            write_jsonl(home / "sessions" / "unknown-chat.jsonl", [
+                meta_row("unknown-chat"), user_row(timestamp=None), agent_event_row(timestamp=None),
+            ])
+            output = Path(temp) / "output"
+            self.assertEqual(exporter.export_history(home, output).exported, 2)
+            summary = exporter.export_history(home, output, created_since="20260101")
+            self.assertEqual((summary.exported, summary.missing_filter_timestamps), (1, 1))
+            summary = exporter.export_history(home, output, last_chat_since="20260101")
+            self.assertEqual((summary.exported, summary.missing_filter_timestamps), (1, 1))
+
+    def test_date_filters_combine_with_archiving_and_deduplication(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            self.write_conversation(home, "selected", "2026-08-01T12:00:00", "2026-09-06T12:00:00")
+            archived = home / "archived_sessions"
+            archived.mkdir()
+            (archived / "copy.jsonl").write_bytes((home / "sessions" / "selected.jsonl").read_bytes())
+            output = Path(temp) / "output"
+            summary = exporter.export_history(home, output, last_chat_since="20260906", ignore_archived=True)
+            self.assertEqual((summary.exported, summary.duplicate_rollouts, summary.ignored_archived), (0, 1, 1))
+            self.assertTrue((output / "projects.toml").exists())
+
+    def test_no_matches_produces_empty_project_index(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            self.write_conversation(home, "old", "2026-08-01T12:00:00", "2026-09-01T12:00:00")
+            output = Path(temp) / "output"
+            summary = exporter.export_history(home, output, created_since="20260901")
+            self.assertEqual((summary.exported, summary.date_filtered), (0, 1))
+            self.assertEqual(list(output.rglob("*.md")), [])
+            self.assertEqual((output / "projects.toml").read_text(encoding="utf-8"), "# Generated by export_codex_history.py.\n")
 
 
 class OutputSafetyTests(unittest.TestCase):
