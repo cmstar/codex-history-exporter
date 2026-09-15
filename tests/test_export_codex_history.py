@@ -119,6 +119,216 @@ def conversation_stub(thread_id, cwd):
     )
 
 
+class InheritedHistoryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name) / "codex"
+        self.output = Path(self.temp.name) / "output"
+        self.base = self.home / "sessions" / "base.jsonl"
+        write_jsonl(self.base, [
+            meta_row(), user_row("前文"), agent_event_row("前文回答"),
+            user_row("失效问题", "2026-07-19T01:03:00Z"),
+            agent_event_row("失效回答", timestamp="2026-07-19T01:04:00Z"),
+        ])
+
+    def branch(self, name="branch", parent=None, count=3, timestamp="2026-07-20T01:00:00Z", rows=None):
+        parent = parent or self.base
+        raw = parent.read_bytes().splitlines(keepends=True)
+        meta = meta_row()
+        meta["timestamp"] = meta["payload"]["timestamp"] = timestamp
+        meta["payload"]["history_mode"] = "paginated"
+        meta["payload"]["history_base"] = {
+            "thread_id": "thread-1", "end_ordinal_exclusive": count,
+            "end_byte_offset": sum(map(len, raw[:count])),
+        }
+        path = self.home / "sessions" / (name + ".jsonl")
+        write_jsonl(path, [meta] + (rows if rows is not None else [
+            user_row("修改后的问题", "2026-07-20T01:01:00Z"),
+            agent_event_row("新回答", timestamp="2026-07-20T01:02:00Z"),
+        ]))
+        return path
+
+    def active(self, path, archived=0):
+        connection = sqlite3.connect(self.home / "state_9.sqlite")
+        try:
+            connection.execute("CREATE TABLE threads (id TEXT, rollout_path TEXT, archived INTEGER)")
+            connection.execute("INSERT INTO threads VALUES (?, ?, ?)", ("thread-1", str(path), archived))
+            connection.commit()
+        finally:
+            connection.close()
+
+    def export(self, **kwargs):
+        summary = exporter.export_history(self.home, self.output, **kwargs)
+        files = list(self.output.rglob("*.md"))
+        self.assertEqual(summary.exported, 1)
+        self.assertEqual(len(files), 1)
+        return summary, files[0].read_text(encoding="utf-8")
+
+    def test_selected_thread_restores_prefix_and_replaces_old_branch(self):
+        current = self.branch()
+        self.active(current)
+        summary, text = self.export(session_id="codex://threads/thread-1")
+        self.assertEqual(summary.merged_rollouts, 1)
+        self.assertEqual(text.count("# 👤 User"), 2)
+        self.assertEqual(text.count("# 🤖 Codex"), 2)
+        self.assertIn("前文回答", text)
+        self.assertIn("修改后的问题", text)
+        self.assertNotIn("失效", text)
+        self.assertFalse((self.output / "projects.toml").exists())
+
+    def test_unique_history_leaf_without_database(self):
+        self.branch()
+        _, text = self.export()
+        self.assertIn("前文回答", text)
+        self.assertNotIn("失效", text)
+
+    def test_multilevel_inheritance(self):
+        first = self.branch()
+        last = self.branch("last", first, count=3, timestamp="2026-07-21T01:00:00Z", rows=[
+            user_row("第三轮", "2026-07-21T01:01:00Z"),
+            agent_event_row("第三轮回答", timestamp="2026-07-21T01:02:00Z"),
+        ])
+        self.active(last)
+        _, text = self.export()
+        self.assertEqual(text.count("# 👤 User"), 3)
+        self.assertLess(text.index("前文回答"), text.index("新回答"))
+        self.assertLess(text.index("新回答"), text.index("第三轮回答"))
+        self.assertNotIn("失效", text)
+
+    def test_rollback_applies_to_inherited_turns(self):
+        self.branch(count=5, rows=[
+            rollback_row(1, "2026-07-20T01:00:00Z"),
+            user_row("回滚后", "2026-07-20T01:01:00Z"),
+            agent_event_row("回滚后回答", timestamp="2026-07-20T01:02:00Z"),
+        ])
+        _, text = self.export()
+        self.assertIn("前文回答", text)
+        self.assertIn("回滚后回答", text)
+        self.assertNotIn("失效", text)
+
+    def test_archived_base_copy_does_not_duplicate_messages(self):
+        duplicate = self.home / "archived_sessions" / "copy.jsonl"
+        duplicate.parent.mkdir()
+        duplicate.write_bytes(self.base.read_bytes())
+        self.branch()
+        _, text = self.export()
+        self.assertEqual(text.count("# 👤 User"), 2)
+
+    def test_creation_filter_uses_original_creation_and_last_chat_uses_new_branch(self):
+        current = self.branch()
+        self.active(current)
+        _, text = self.export(created_since="20260719", created_until="20260719",
+                              last_chat_since="20260720", last_chat_until="20260720")
+        self.assertIn("新回答", text)
+
+    def test_current_database_path_wins_over_newer_unused_branch(self):
+        current = self.branch()
+        self.branch("unused", timestamp="2026-07-21T01:00:00Z", rows=[
+            user_row("不应导出", "2026-07-21T01:01:00Z"),
+        ])
+        self.active(current)
+        _, text = self.export()
+        self.assertIn("新回答", text)
+        self.assertNotIn("不应导出", text)
+
+    def test_relocated_database_path_uses_unique_filename(self):
+        current = self.branch()
+        self.active("X:\\old-computer\\sessions\\" + current.name)
+        self.export()
+
+    def test_archive_filter_applies_after_reconstruction(self):
+        current = self.branch()
+        self.active(current, archived=1)
+        summary = exporter.export_history(self.home, self.output, ignore_archived=True)
+        self.assertEqual(summary.exported, 0)
+        self.assertEqual(summary.ignored_archived, 1)
+
+    def test_missing_base_preserves_existing_output(self):
+        self.branch()
+        self.base.unlink()
+        self.output.mkdir()
+        (self.output / "keep.txt").write_text("keep", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "history_base"):
+            exporter.export_history(self.home, self.output)
+        self.assertEqual((self.output / "keep.txt").read_text(encoding="utf-8"), "keep")
+        self.assertFalse(self.output.with_name("output.__staging__").exists())
+
+    def test_incorrect_byte_boundary_is_rejected(self):
+        current = self.branch()
+        rows = [json.loads(line) for line in current.read_text(encoding="utf-8").splitlines()]
+        rows[0]["payload"]["history_base"]["end_byte_offset"] += 1
+        write_jsonl(current, rows)
+        with self.assertRaisesRegex(RuntimeError, "history_base"):
+            exporter.export_history(self.home, self.output)
+
+    def test_crlf_and_non_ascii_byte_boundary(self):
+        self.base.write_bytes(self.base.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+        self.branch()
+        _, text = self.export()
+        self.assertIn("前文回答", text)
+
+    def test_ambiguous_current_branch_is_rejected(self):
+        self.branch()
+        self.branch("other", rows=[user_row("其他分支")])
+        with self.assertRaisesRegex(RuntimeError, "ambiguous current rollout"):
+            exporter.export_history(self.home, self.output)
+
+    def test_same_size_but_different_base_prefixes_are_rejected(self):
+        other = self.home / "sessions" / "other-base.jsonl"
+        other.write_bytes(self.base.read_bytes().replace("前文".encode(), "异文".encode()))
+        current = self.branch()
+        self.active(current)
+        with self.assertRaisesRegex(RuntimeError, "ambiguous history_base"):
+            exporter.export_history(self.home, self.output)
+
+    def test_invalid_record_boundary_is_rejected(self):
+        current = self.branch()
+        rows = [json.loads(line) for line in current.read_text(encoding="utf-8").splitlines()]
+        rows[0]["payload"]["history_base"]["end_ordinal_exclusive"] = True
+        write_jsonl(current, rows)
+        with self.assertRaisesRegex(RuntimeError, "invalid history_base boundary"):
+            exporter.export_history(self.home, self.output)
+
+    def test_cycle_fails_without_recursing_forever(self):
+        meta = meta_row()
+        meta["payload"]["history_base"] = {
+            "thread_id": "thread-1", "end_ordinal_exclusive": 1, "end_byte_offset": 0,
+        }
+        # Stabilize the self-referencing metadata's byte count.
+        for _ in range(5):
+            write_jsonl(self.base, [meta])
+            meta["payload"]["history_base"]["end_byte_offset"] = self.base.stat().st_size
+        write_jsonl(self.base, [meta])
+        other = self.home / "sessions" / "cycle.jsonl"
+        other.write_bytes(self.base.read_bytes())
+        with self.assertRaisesRegex(RuntimeError, "history_base"):
+            exporter.export_history(self.home, self.output)
+
+    def test_zero_boundary_needs_no_base_file(self):
+        current = self.branch(count=0)
+        self.base.unlink()
+        self.active(current)
+        _, text = self.export()
+        self.assertNotIn("前文", text)
+        self.assertIn("新回答", text)
+
+    def test_missing_current_database_path_is_rejected(self):
+        self.branch()
+        self.active(self.home / "sessions" / "missing.jsonl")
+        with self.assertRaisesRegex(RuntimeError, "cannot locate current rollout"):
+            exporter.export_history(self.home, self.output)
+
+    def test_unrelated_broken_history_does_not_block_selected_thread(self):
+        current = self.branch()
+        rows = [json.loads(line) for line in current.read_text(encoding="utf-8").splitlines()]
+        rows[0]["payload"]["id"] = "unrelated"
+        rows[0]["payload"]["history_base"]["thread_id"] = "missing"
+        write_jsonl(current, rows)
+        _, text = self.export(session_id="thread-1")
+        self.assertIn("前文回答", text)
+
+
 class SessionSelectorTests(unittest.TestCase):
     def test_keeps_a_plain_session_id(self):
         self.assertEqual(
@@ -615,7 +825,7 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(len(thread_one), 1)
             self.assertIn("- Archived: `false`", thread_one[0].read_text(encoding="utf-8"))
 
-    def test_export_preserves_divergent_rollouts_with_the_same_thread_id(self):
+    def test_export_rejects_ambiguous_rollouts_and_preserves_existing_output(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             codex_home = self.make_codex_home(root)
@@ -628,24 +838,12 @@ class EndToEndTests(unittest.TestCase):
                 ],
             )
             output = root / "output"
-
-            summary = exporter.export_history(codex_home, output)
-
-            files = list(output.rglob("*.md"))
-            thread_one = [
-                path
-                for path in files
-                if "Thread ID: `thread-one`" in path.read_text(encoding="utf-8")
-            ]
-            self.assertEqual(summary.exported, 3)
-            self.assertEqual(summary.duplicate_rollouts, 0)
-            self.assertEqual(len(thread_one), 2)
-            self.assertTrue(
-                any("问题一" in path.read_text(encoding="utf-8") for path in thread_one)
-            )
-            self.assertTrue(
-                any("不同分支" in path.read_text(encoding="utf-8") for path in thread_one)
-            )
+            output.mkdir()
+            (output / "keep.txt").write_text("keep", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "ambiguous current rollout"):
+                exporter.export_history(codex_home, output)
+            self.assertEqual((output / "keep.txt").read_text(encoding="utf-8"), "keep")
+            self.assertFalse(output.with_name("output.__staging__").exists())
 
     def test_export_can_ignore_archived_conversations(self):
         with tempfile.TemporaryDirectory() as temp:

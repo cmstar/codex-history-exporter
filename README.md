@@ -141,7 +141,13 @@ Path = '''/home/user/Workspace/项目1'''
 
 确认覆盖后，每次执行都会完整重建目标目录。脚本先在 staging 目录生成全部文件，成功后才替换现有输出；生成阶段失败时会保留上一次的结果。如果输出根目录被占用而无法整体改名，脚本会自动改用带备份和回滚的目录内替换。
 
-脚本会同时扫描 `sessions` 与 `archived_sessions`。如果同一个 Thread ID 在两个目录中留下了可见对话完全相同的 rollout，只导出一份，并优先采用 Codex 状态数据库记录的归档状态；如果同一 Thread ID 的可见对话不同，则保留两份，避免静默丢失历史分支。使用 `--ignore-archived` 时，去重后的归档对话不会写入输出。命令行统计中的 `archived conversations ignored` 会显示被忽略的归档对话数量，`duplicate rollouts excluded` 会显示被排除的相同副本数量；`empty sessions` 与 `invalid rollouts` 会进一步说明 `skipped` 分别来自无可见消息的会话还是无有效会话元数据的记录。
+脚本会同时扫描 `sessions` 与 `archived_sessions`，同一个 Thread ID 最终只输出一个 Markdown 文件。状态数据库中的 `rollout_path` 优先决定当前日志；数据库没有该字段或记录时，通过日志的历史继承关系寻找唯一的最终版本，相同副本只保留一份。
+
+对于含有 `history_base` 的日志，脚本会同时校验基础日志的 `end_ordinal_exclusive`（记录边界，不包含该记录）和 `end_byte_offset`（字节边界），恢复边界之前的历史，再接入当前日志。支持递归恢复多段历史；消息提取、回滚处理及日期筛选均在恢复之后进行。同一对话的创建时间沿用基础历史的创建时间，最后聊天时间取最终有效消息的时间。例如，编辑提问后生成一份新日志，导出会保留编辑前的有效前文和修改后的提问、回答，排除被替换的旧分支。
+
+基础日志缺失、边界不匹配或存在无法确定的多个分支时，脚本会报错并保留已有输出，不会拼接猜测出的历史，也不会将一个对话拆成多个文件。复制到其他电脑的数据目录可通过唯一同名日志匹配数据库中已失效的原路径。
+
+使用 `--ignore-archived` 时，归档状态仍优先采用状态数据库，恢复后的归档对话不会写入输出。命令行统计中的 `archived conversations ignored` 显示被忽略的归档对话数量，`duplicate rollouts excluded` 显示按可见内容排除的相同副本数量，`historical rollouts consolidated` 显示通过当前版本选择或历史恢复收拢的额外日志数量；`empty sessions` 与 `invalid rollouts` 说明 `skipped` 分别来自无可见消息的会话还是无有效会话元数据的记录。
 
 ## 项目判断规则
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
 import ntpath
 import os
@@ -67,6 +68,7 @@ class ExportSummary:
     output_root: Path
     date_filtered: int = 0
     missing_filter_timestamps: int = 0
+    merged_rollouts: int = 0
 
 
 @dataclass(frozen=True)
@@ -261,7 +263,8 @@ def _is_subagent(meta: dict) -> bool:
 
 
 def _parse_rollout_with_status(
-    path: Path, session_id: Optional[str] = None
+    path: Path, session_id: Optional[str] = None,
+    history: Optional[Iterable[str]] = None,
 ) -> _ParseOutcome:
     meta = None
     turns: List[_ConversationTurn] = []
@@ -269,12 +272,13 @@ def _parse_rollout_with_status(
     sequence = 0
 
     try:
-        stream = path.open("r", encoding="utf-8", errors="replace")
+        stream = (path.open("r", encoding="utf-8", errors="replace")
+                  if history is None else nullcontext(history))
     except OSError:
         return _ParseOutcome(None, "invalid", 0)
 
-    with stream:
-        for line_number, line in enumerate(stream, start=1):
+    with stream as lines:
+        for line_number, line in enumerate(lines, start=1):
             if not line.strip():
                 continue
             try:
@@ -734,6 +738,162 @@ def _duplicate_conversation_key(conversation: ParsedConversation) -> tuple:
     )
 
 
+def _load_database_rollout_paths(codex_home: Path) -> Dict[str, str]:
+    databases = sorted(
+        codex_home.glob("state_*.sqlite"), key=_state_database_sort_key, reverse=True
+    )
+    if not databases:
+        return {}
+    database_path = databases[0].resolve()
+    try:
+        connection = sqlite3.connect(database_path.as_uri() + "?mode=ro", uri=True)
+        try:
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(threads)")}
+            if not {"id", "rollout_path"}.issubset(columns):
+                return {}
+            return {
+                thread_id: path
+                for thread_id, path in connection.execute("SELECT id, rollout_path FROM threads")
+                if isinstance(thread_id, str) and isinstance(path, str) and path
+            }
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error) as error:
+        print("warning: cannot read {}: {}".format(database_path, error), file=sys.stderr)
+        return {}
+
+
+class _RolloutHistories:
+    """Resolve history_base before applying message extraction or rollback events.
+
+    Boundaries are checked against source bytes, never reserialized JSON. A base
+    is accepted only when both its record count and byte offset agree, and all
+    matching candidates reconstruct the same prefix.
+    """
+
+    def __init__(self, paths: Sequence[Path], active_paths: Dict[str, str]):
+        self.paths = paths
+        self.active_paths = active_paths
+        self.metadata: Dict[Path, dict] = {}
+        self.groups: Dict[str, List[Path]] = {}
+        self.merged_rollouts = 0
+        for path in paths:
+            try:
+                with path.open("r", encoding="utf-8", errors="replace") as stream:
+                    for line in stream:
+                        try:
+                            row = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(row, dict) or row.get("type") != "session_meta":
+                            continue
+                        meta = row.get("payload")
+                        if isinstance(meta, dict):
+                            self.metadata[path] = {
+                                key: meta[key] for key in (
+                                    "id", "timestamp", "cwd", "source",
+                                    "thread_source", "history_base",
+                                ) if key in meta
+                            }
+                            thread_id = meta.get("id")
+                            if isinstance(thread_id, str) and thread_id.strip() and not _is_subagent(meta):
+                                self.groups.setdefault(thread_id, []).append(path)
+                        break
+            except OSError:
+                pass  # The normal parser retains invalid-rollout reporting.
+
+    def _resolve(self, path: Path, cache: dict, stack: tuple = (), limit=None):
+        if path in stack:
+            raise RuntimeError("cyclic history_base: {}".format(path))
+        raw = cache.get(path)
+        if raw is None:
+            raw = path.read_bytes().splitlines(keepends=True)
+            cache[path] = raw
+        local = raw if limit is None else raw[:limit]
+        meta = self.metadata[path]
+        base = meta.get("history_base")
+        if base is None:
+            return local, {path}, meta.get("timestamp")
+        if not isinstance(base, dict):
+            raise RuntimeError("invalid history_base: {}".format(path))
+        count, offset = base.get("end_ordinal_exclusive"), base.get("end_byte_offset")
+        if (type(count) is not int or type(offset) is not int or count < 0 or offset < 0
+                or not isinstance(base.get("thread_id"), str)):
+            raise RuntimeError("invalid history_base boundary: {}".format(path))
+        if count == 0 and offset == 0:
+            return local, {path}, meta.get("timestamp")
+        matches = []
+        child_time = _parse_timestamp(meta.get("timestamp"))
+        for candidate in self.groups.get(base["thread_id"], []):
+            if candidate == path or candidate in stack:
+                continue
+            parent_time = _parse_timestamp(self.metadata[candidate].get("timestamp"))
+            if child_time and parent_time and parent_time > child_time:
+                continue
+            parent_raw = cache.get(candidate)
+            if parent_raw is None:
+                parent_raw = candidate.read_bytes().splitlines(keepends=True)
+                cache[candidate] = parent_raw
+            if count > len(parent_raw) or sum(map(len, parent_raw[:count])) != offset:
+                continue
+            prefix, ancestors, created = self._resolve(candidate, cache, stack + (path,), count)
+            matches.append((prefix, ancestors, created))
+        if not matches:
+            raise RuntimeError("missing or mismatched history_base for {}".format(path))
+        prefix, ancestors, created = matches[0]
+        if any(other[0] != prefix for other in matches[1:]):
+            raise RuntimeError("ambiguous history_base for {}".format(path))
+        ancestors = set().union(*(match[1] for match in matches))
+        if base["thread_id"] != meta.get("id"):
+            created = meta.get("timestamp")
+        return prefix + local, ancestors | {path}, created
+
+    def outcomes(self, session_id: Optional[str]):
+        handled = set()
+        for path in self.paths:
+            meta = self.metadata.get(path, {})
+            thread_id = meta.get("id")
+            if session_id is not None and thread_id != session_id:
+                continue
+            if not isinstance(thread_id, str) or _is_subagent(meta) or not thread_id.strip():
+                yield _parse_rollout_with_status(path, session_id)
+                continue
+            if thread_id in handled:
+                continue
+            handled.add(thread_id)
+            group = self.groups[thread_id]
+            active = self.active_paths.get(thread_id)
+            paginated = any(self.metadata[p].get("history_base") is not None for p in group)
+            if not paginated and not active:
+                for candidate in group:
+                    yield _parse_rollout_with_status(candidate, session_id)
+                continue
+            cache = {}
+            if active:
+                candidates = [p for p in group if _normalize_path(str(p.resolve())) == _normalize_path(active)]
+                if not candidates:
+                    # A copied Codex home can contain paths from a different machine.
+                    candidates = [p for p in group if p.name == _path_name(active)]
+                if len(candidates) != 1:
+                    raise RuntimeError("cannot locate current rollout for thread {}: {}".format(thread_id, active))
+                selected = candidates[0]
+                lines, _, created = self._resolve(selected, cache)
+            else:
+                resolved = {p: self._resolve(p, cache) for p in group}
+                ancestors = set().union(*(value[1] - {p} for p, value in resolved.items()))
+                leaves = [p for p in group if p not in ancestors]
+                if not leaves or any(resolved[p][0] != resolved[leaves[0]][0] for p in leaves[1:]):
+                    raise RuntimeError("ambiguous current rollout for thread {}".format(thread_id))
+                selected = leaves[0]
+                lines, _, created = resolved[selected]
+            # Select current metadata, while keeping the original creation time.
+            effective_meta = dict(self.metadata[selected], timestamp=created)
+            history = [json.dumps({"type": "session_meta", "payload": effective_meta})]
+            history.extend(line.decode("utf-8", errors="replace") for line in lines)
+            self.merged_rollouts += len(group) - 1
+            yield _parse_rollout_with_status(selected, session_id, history)
+
+
 def _prefer_duplicate_conversation(
     current: ParsedConversation,
     candidate: ParsedConversation,
@@ -873,6 +1033,7 @@ def export_history(
         raise ValueError("ignore_archived is only available for full exports")
 
     rollouts = _discover_rollouts(codex_home)
+    histories = _RolloutHistories(rollouts, _load_database_rollout_paths(codex_home))
     titles = load_titles(codex_home)
     archived_states = _load_database_archived_states(codex_home)
     resolver = ProjectResolver.from_codex_home(codex_home)
@@ -896,8 +1057,7 @@ def export_history(
     project_paths: Dict[str, Set[str]] = {}
     conversations: Dict[tuple, ParsedConversation] = {}
     try:
-        for rollout in rollouts:
-            outcome = _parse_rollout_with_status(rollout, session_id)
+        for outcome in histories.outcomes(session_id):
             if outcome.status == "filtered":
                 continue
             if session_id is not None:
@@ -923,6 +1083,14 @@ def export_history(
                 )
                 continue
             conversations[duplicate_key] = conversation
+
+        thread_ids: Set[str] = set()
+        for conversation in conversations.values():
+            if conversation.thread_id in thread_ids:
+                raise RuntimeError(
+                    "ambiguous current rollout for thread {}".format(conversation.thread_id)
+                )
+            thread_ids.add(conversation.thread_id)
 
         for conversation in conversations.values():
             if ignore_archived and _conversation_is_archived(
@@ -995,6 +1163,7 @@ def export_history(
         output_root=output_root,
         date_filtered=date_filtered,
         missing_filter_timestamps=missing_filter_timestamps,
+        merged_rollouts=histories.merged_rollouts,
     )
 
 
@@ -1115,6 +1284,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print("  conversations outside date filters: {}".format(summary.date_filtered))
     print("  conversations missing filter timestamps: {}".format(summary.missing_filter_timestamps))
     print("  duplicate rollouts excluded: {}".format(summary.duplicate_rollouts))
+    print("  historical rollouts consolidated: {}".format(summary.merged_rollouts))
     print("  empty sessions: {}".format(summary.empty_sessions))
     print("  invalid rollouts: {}".format(summary.invalid_rollouts))
     print("  skipped: {}".format(summary.skipped))
