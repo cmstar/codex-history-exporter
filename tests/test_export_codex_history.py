@@ -196,6 +196,53 @@ class InheritedHistoryTests(unittest.TestCase):
         self.assertLess(text.index("新回答"), text.index("第三轮回答"))
         self.assertNotIn("失效", text)
 
+    def numbered_history(self):
+        def number(path, start):
+            rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            for index, row in enumerate(rows, start):
+                row["ordinal"] = index
+            write_jsonl(path, rows)
+
+        number(self.base, 0)
+        segment_id = "01a041d9-8516-71d2-a720-a8f937e55386"
+        first = self.branch("rollout-2026-07-20T01-00-00-thread-1_" + segment_id, rows=[
+            user_row("修改后的问题"), agent_event_row("新回答"),
+            user_row("分段内被替换的问题"), agent_event_row("分段内被替换的回答"),
+        ])
+        number(first, 3)
+        last = self.branch("last", first, count=3, timestamp="2026-07-21T01:00:00Z", rows=[
+            user_row("第三轮"), agent_event_row("第三轮回答"),
+        ])
+        rows = [json.loads(line) for line in last.read_text(encoding="utf-8").splitlines()]
+        rows[0]["payload"]["history_base"].update(
+            thread_id=segment_id, end_ordinal_exclusive=6,
+        )
+        write_jsonl(last, rows)
+        number(last, 6)
+        self.active(last)
+        return first, last
+
+    def test_segment_id_and_global_ordinals_restore_history_and_creation_time(self):
+        self.numbered_history()
+        _, text = self.export(created_since="20260719", created_until="20260719")
+        self.assertEqual(text.count("# 👤 User"), 3)
+        self.assertLess(text.index("前文回答"), text.index("新回答"))
+        self.assertLess(text.index("新回答"), text.index("第三轮回答"))
+        self.assertNotIn("被替换", text)
+        self.assertNotIn("失效", text)
+
+    def test_global_ordinal_mismatch_is_rejected_even_with_valid_byte_offset(self):
+        _, last = self.numbered_history()
+        rows = [json.loads(line) for line in last.read_text(encoding="utf-8").splitlines()]
+        rows[0]["payload"]["history_base"]["end_ordinal_exclusive"] = 3
+        write_jsonl(last, rows)
+        with self.assertRaisesRegex(RuntimeError, "history_base"):
+            self.export()
+
+    def test_ordinal_gap_is_rejected_even_with_valid_endpoints(self):
+        raw = [json.dumps({"ordinal": n}).encode() + b"\n" for n in (3, 3, 5)]
+        self.assertIsNone(exporter._RolloutHistories._prefix_length(raw, 6, sum(map(len, raw))))
+
     def test_rollback_applies_to_inherited_turns(self):
         self.branch(count=5, rows=[
             rollback_row(1, "2026-07-20T01:00:00Z"),
@@ -214,6 +261,23 @@ class InheritedHistoryTests(unittest.TestCase):
         self.branch()
         _, text = self.export()
         self.assertEqual(text.count("# 👤 User"), 2)
+
+    def test_longer_exact_prefix_copy_without_database_preserves_later_messages(self):
+        duplicate = self.home / "archived_sessions" / self.base.name
+        duplicate.parent.mkdir()
+        duplicate.write_bytes(self.base.read_bytes() + (
+            json.dumps(user_row("后续问题"), ensure_ascii=False) + "\n"
+        ).encode("utf-8"))
+        summary, text = self.export()
+        self.assertIn("后续问题", text)
+        self.assertEqual(text.count("# 👤 User"), 3)
+        self.assertEqual(summary.merged_rollouts, 1)
+
+    def test_divergent_copies_without_database_are_not_selected_by_size(self):
+        duplicate = self.home / "archived_sessions" / self.base.name
+        write_jsonl(duplicate, [meta_row(), user_row("不同的分支")])
+        with self.assertRaisesRegex(RuntimeError, "ambiguous current rollout"):
+            self.export()
 
     def test_creation_filter_uses_original_creation_and_last_chat_uses_new_branch(self):
         current = self.branch()
@@ -236,6 +300,23 @@ class InheritedHistoryTests(unittest.TestCase):
         current = self.branch()
         self.active("X:\\old-computer\\sessions\\" + current.name)
         self.export()
+
+    def test_database_path_alias_resolves_before_duplicate_filename_fallback(self):
+        current = self.branch()
+        duplicate = self.home / "archived_sessions" / current.name
+        write_jsonl(duplicate, [meta_row(), user_row("不应选择归档副本")])
+        alias = self.home / "old-home" / "sessions" / current.name
+        self.active(alias)
+        original_resolve = Path.resolve
+
+        def resolve(path, *args, **kwargs):
+            return original_resolve(current if path == alias else path, *args, **kwargs)
+
+        # Emulate a junction without requiring Windows symlink privileges.
+        with mock.patch.object(Path, "resolve", resolve):
+            _, text = self.export()
+        self.assertIn("新回答", text)
+        self.assertNotIn("不应选择归档副本", text)
 
     def test_archive_filter_applies_after_reconstruction(self):
         current = self.branch()

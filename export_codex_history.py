@@ -776,6 +776,7 @@ class _RolloutHistories:
         self.active_paths = active_paths
         self.metadata: Dict[Path, dict] = {}
         self.groups: Dict[str, List[Path]] = {}
+        self.segments: Dict[str, List[Path]] = {}
         self.merged_rollouts = 0
         for path in paths:
             try:
@@ -798,6 +799,15 @@ class _RolloutHistories:
                             thread_id = meta.get("id")
                             if isinstance(thread_id, str) and thread_id.strip() and not _is_subagent(meta):
                                 self.groups.setdefault(thread_id, []).append(path)
+                                # Edited paginated logs retain the conversation ID in
+                                # metadata, but their filename carries a new segment ID.
+                                segment = re.fullmatch(
+                                    r"rollout-.+-" + re.escape(thread_id)
+                                    + r"_([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})",
+                                    path.stem,
+                                )
+                                if segment:
+                                    self.segments.setdefault(segment[1], []).append(path)
                         break
             except OSError:
                 pass  # The normal parser retains invalid-rollout reporting.
@@ -824,7 +834,11 @@ class _RolloutHistories:
             return local, {path}, meta.get("timestamp")
         matches = []
         child_time = _parse_timestamp(meta.get("timestamp"))
-        for candidate in self.groups.get(base["thread_id"], []):
+        candidates = list(dict.fromkeys(
+            self.groups.get(base["thread_id"], [])
+            + self.segments.get(base["thread_id"], [])
+        ))
+        for candidate in candidates:
             if candidate == path or candidate in stack:
                 continue
             parent_time = _parse_timestamp(self.metadata[candidate].get("timestamp"))
@@ -834,9 +848,12 @@ class _RolloutHistories:
             if parent_raw is None:
                 parent_raw = candidate.read_bytes().splitlines(keepends=True)
                 cache[candidate] = parent_raw
-            if count > len(parent_raw) or sum(map(len, parent_raw[:count])) != offset:
+            local_count = self._prefix_length(parent_raw, count, offset)
+            if local_count is None:
                 continue
-            prefix, ancestors, created = self._resolve(candidate, cache, stack + (path,), count)
+            prefix, ancestors, created = self._resolve(candidate, cache, stack + (path,), local_count)
+            if self.metadata[candidate].get("id") != meta.get("id"):
+                created = meta.get("timestamp")
             matches.append((prefix, ancestors, created))
         if not matches:
             raise RuntimeError("missing or mismatched history_base for {}".format(path))
@@ -844,9 +861,37 @@ class _RolloutHistories:
         if any(other[0] != prefix for other in matches[1:]):
             raise RuntimeError("ambiguous history_base for {}".format(path))
         ancestors = set().union(*(match[1] for match in matches))
-        if base["thread_id"] != meta.get("id"):
-            created = meta.get("timestamp")
         return prefix + local, ancestors | {path}, created
+
+    @staticmethod
+    def _prefix_length(raw, end_ordinal, end_offset):
+        """Translate a global ordinal and file-local byte offset to a line count."""
+        position = 0
+        for length, line in enumerate(raw, 1):
+            position += len(line)
+            if position > end_offset:
+                return None
+            if position != end_offset:
+                continue
+            try:
+                first = json.loads(raw[0])
+            except (ValueError, UnicodeDecodeError):
+                first = {}
+            if not isinstance(first, dict) or "ordinal" not in first:
+                return length if length == end_ordinal else None
+            start = first["ordinal"]
+            if type(start) is not int or start < 0 or start + length != end_ordinal:
+                return None
+            for index, record in enumerate(raw[:length]):
+                try:
+                    row = json.loads(record)
+                except (ValueError, UnicodeDecodeError):
+                    return None
+                if (not isinstance(row, dict) or type(row.get("ordinal")) is not int
+                        or row["ordinal"] != start + index):
+                    return None
+            return length
+        return None
 
     def outcomes(self, session_id: Optional[str]):
         handled = set()
@@ -865,12 +910,25 @@ class _RolloutHistories:
             active = self.active_paths.get(thread_id)
             paginated = any(self.metadata[p].get("history_base") is not None for p in group)
             if not paginated and not active:
+                if len(group) > 1:
+                    copies = {p: p.read_bytes() for p in group}
+                    longest = max(copies.values(), key=len)
+                    if all(longest.startswith(raw) for raw in copies.values()):
+                        complete = [p for p in group if copies[p] == longest]
+                        self.merged_rollouts += len(group) - len(complete)
+                        group = complete
                 for candidate in group:
                     yield _parse_rollout_with_status(candidate, session_id)
                 continue
             cache = {}
             if active:
-                candidates = [p for p in group if _normalize_path(str(p.resolve())) == _normalize_path(active)]
+                active_names = {_normalize_path(active)}
+                try:
+                    # Resolve both sides: Codex home may be a symlink or Windows junction.
+                    active_names.add(_normalize_path(str(Path(active).resolve())))
+                except (OSError, RuntimeError):
+                    pass  # Retain filename fallback for unavailable or copied paths.
+                candidates = [p for p in group if _normalize_path(str(p.resolve())) in active_names]
                 if not candidates:
                     # A copied Codex home can contain paths from a different machine.
                     candidates = [p for p in group if p.name == _path_name(active)]
