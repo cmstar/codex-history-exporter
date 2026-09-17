@@ -64,6 +64,27 @@ python ./export_codex_history.py --ignore-archived
 
 如果曾编辑用户消息并生成多个版本，导出结果只保留最终有效分支；被后续编辑回滚的旧问题、旧回答及其后续分支不会写入 Markdown。
 
+### 仅导出指定项目目录
+
+使用 `--project-dir` 指定一个或多个目标目录，也可以重复传入该选项：
+
+```powershell
+# 一个目录
+python ./export_codex_history.py --project-dir "D:\Workspace\my\ai\directodo"
+
+# 多个目录，命中任意一个即可
+python ./export_codex_history.py --project-dir "D:\Workspace\my\ai\directodo" "D:\Workspace\my\ai\codex-history-exporter"
+
+# 重复选项，并组合归档、时间筛选
+python ./export_codex_history.py --project-dir "D:\Work\项目 A" --project-dir "D:\Work\项目 B" --ignore-archived --last-chat-since 20260901
+```
+
+匹配会话的工作目录或已识别的项目根目录，包含目标目录本身和子目录，不会把 `Alpha-backup` 当作 `Alpha` 的子目录。明确分配到项目的会话也会匹配该项目配置的任一根目录，因此可纳入工作目录位于外部 worktree 的会话。仅凭目录名称相同不会匹配；输出仍按原有项目规则分类。
+
+相对路径以运行命令时的工作目录为基准，支持 `~` 和环境变量展开；Windows 路径忽略大小写与斜杠方向差异。目标目录无需仍然存在，可筛选已移动或删除目录的历史会话。不传此选项时保持原有全量导出行为。
+
+该选项仅用于批量导出，不能与 session ID 或 deep link 同用。目录筛选与时间、归档筛选需同时满足；命中后导出整个会话的完整有效历史。重复或重叠的目标目录不会导致重复导出。未命中任何会话时生成空项目索引；覆盖已有输出仍需确认。导出摘要中的 `conversations outside directory filters` 表示被目录筛选排除的会话数。
+
 ### 按创建时间或最后聊天时间筛选
 
 批量导出支持四个时间筛选参数：

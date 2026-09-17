@@ -1227,6 +1227,118 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(len(list(output.rglob("*.md"))), 2)
 
 
+class DirectoryFilterTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name) / "home"
+        self.output = Path(self.temp.name) / "output"
+
+    def write(self, thread_id, cwd, archived=False):
+        folder = "archived_sessions" if archived else "sessions"
+        write_jsonl(self.home / folder / (thread_id + ".jsonl"), [
+            meta_row(thread_id, cwd), user_row(thread_id), agent_event_row(),
+        ])
+
+    def ids(self):
+        return {
+            line for path in self.output.rglob("*.md")
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.startswith("- Thread ID:")
+        }
+
+    def test_multiple_directories_boundaries_and_overlap(self):
+        for thread_id, cwd in [
+            ("exact", r"C:\Work\Alpha"), ("child", r"C:\Work\Alpha\src"),
+            ("sibling", r"C:\Work\Alpha-backup"), ("other", "D:/Beta"),
+            ("same-name", "D:/Elsewhere/Alpha"), ("unknown", None),
+        ]:
+            self.write(thread_id, cwd)
+        summary = exporter.export_history(self.home, self.output, project_dirs=[
+            "c:/WORK/alpha/", r"C:\Work\Alpha\src", "D:/Beta", "D:/Beta",
+        ])
+        self.assertEqual(summary.exported, 3)
+        self.assertEqual(summary.directory_filtered, 3)
+        self.assertEqual(self.ids(), {"- Thread ID: `" + s + "`" for s in ("exact", "child", "other")})
+        index = (self.output / "projects.toml").read_text(encoding="utf-8")
+        self.assertNotIn("Alpha-backup", index)
+        self.assertEqual(exporter.export_history(self.home, self.output).exported, 6)
+
+    def test_assigned_worktree_matches_any_project_root(self):
+        self.write("worktree", "C:/worktrees/branch")
+        self.write("unrelated", "D:/Other/Alpha")
+        (self.home / ".codex-global-state.json").write_text(json.dumps({
+            "local-projects": {"p": {"name": "Alpha", "rootPaths": ["C:/Work/Alpha", "D:/Mirror/Alpha"]}},
+            "thread-project-assignments": {"worktree": {"projectKind": "local", "projectId": "p"}},
+        }), encoding="utf-8")
+        for root in ("C:/Work/Alpha", "D:/Mirror/Alpha"):
+            with self.subTest(root=root):
+                summary = exporter.export_history(self.home, self.output, project_dirs=[root])
+                self.assertEqual(summary.exported, 1)
+                self.assertEqual(self.ids(), {"- Thread ID: `worktree`"})
+
+    def test_relative_paths_and_posix_case_and_root(self):
+        self.write("relative", str(Path.cwd() / "nonexistent-project" / "src"))
+        self.write("posix", "/work/Alpha/src")
+        self.write("case", "/work/alpha/src")
+        summary = exporter.export_history(self.home, self.output, project_dirs=["./nonexistent-project/../nonexistent-project"])
+        self.assertEqual(summary.exported, 1)
+        summary = exporter.export_history(self.home, self.output, project_dirs=["/work/Alpha"])
+        self.assertEqual(summary.exported, 1)
+        self.assertEqual(self.ids(), {"- Thread ID: `posix`"})
+        summary = exporter.export_history(self.home, self.output, project_dirs=["/"])
+        self.assertIn("- Thread ID: `posix`", self.ids())
+        self.assertIn("- Thread ID: `case`", self.ids())
+
+    def test_combines_with_dates_and_archives_and_empty_result(self):
+        self.write("active", "C:/Work/Alpha")
+        self.write("archived", "C:/Work/Alpha", archived=True)
+        self.write("outside", "D:/Other")
+        summary = exporter.export_history(self.home, self.output, project_dirs=["C:/Work"], ignore_archived=True, created_since="20260101")
+        self.assertEqual(summary.exported, 1)
+        self.assertEqual(summary.ignored_archived, 1)
+        self.assertEqual(summary.directory_filtered, 1)
+        summary = exporter.export_history(self.home, self.output, project_dirs=["C:/Work"], created_since="20270101")
+        self.assertEqual(summary.exported, 0)
+        self.assertEqual(summary.date_filtered, 2)
+        self.assertTrue((self.output / "projects.toml").is_file())
+        summary = exporter.export_history(self.home, self.output, project_dirs=["Z:/Missing"])
+        self.assertEqual(summary.exported, 0)
+        self.assertEqual(summary.directory_filtered, 3)
+
+    def test_cli_multiple_and_repeated_options(self):
+        self.write("one", "C:/Alpha")
+        self.write("two", "C:/Beta")
+        self.write("three", "C:/Gamma")
+        self.write("outside", "C:/Delta")
+        with mock.patch("builtins.print"):
+            code = exporter.main([
+                "--codex-home", str(self.home), "-o", str(self.output),
+                "--project-dir", "C:/Alpha", "C:/Beta", "--project-dir", "C:/Gamma",
+            ])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.ids()), 3)
+
+    def test_invalid_or_conflicting_filters_preserve_output_before_prompt(self):
+        self.write("one", "C:/Alpha")
+        self.output.mkdir()
+        marker = self.output / "keep.txt"
+        marker.write_text("keep", encoding="utf-8")
+        cases = [([""], None), (["C:relative"], None), (["C:/Alpha"], "one"),
+                 (["C:/Alpha"], "codex://threads/one")]
+        for paths, selector in cases:
+            with self.subTest(paths=paths, selector=selector):
+                with self.assertRaises(ValueError):
+                    exporter.export_history(self.home, self.output, project_dirs=paths, session_id=selector)
+                args = ["--codex-home", str(self.home), "-o", str(self.output), "--project-dir", *paths]
+                if selector:
+                    args += ["--session-id", selector]
+                with mock.patch("builtins.input") as prompt, mock.patch("builtins.print"):
+                    self.assertEqual(exporter.main(args), 1)
+                    prompt.assert_not_called()
+                self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
+
+
 class DateFilterTests(unittest.TestCase):
     @staticmethod
     def local_timestamp(value):

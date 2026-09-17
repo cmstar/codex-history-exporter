@@ -8,6 +8,7 @@ from contextlib import nullcontext
 import json
 import ntpath
 import os
+import posixpath
 import re
 import shutil
 import sqlite3
@@ -69,6 +70,7 @@ class ExportSummary:
     date_filtered: int = 0
     missing_filter_timestamps: int = 0
     merged_rollouts: int = 0
+    directory_filtered: int = 0
 
 
 @dataclass(frozen=True)
@@ -525,6 +527,32 @@ def _is_under_path(candidate: str, root: str) -> bool:
     return candidate == root or candidate.startswith(root + "/")
 
 
+def _directory_filter_path(value: str) -> str:
+    if not isinstance(value, str) or not value.strip() or "\x00" in value:
+        raise ValueError("--project-dir requires a nonempty directory path")
+    value = os.path.expandvars(os.path.expanduser(value.strip()))
+    if ntpath.splitdrive(value)[0]:
+        if not ntpath.isabs(value):
+            raise ValueError("--project-dir requires an absolute Windows path: " + value)
+        value = ntpath.normpath(value).replace("\\", "/")
+        if value.startswith("//?/UNC/"):
+            value = "//" + value[8:]
+        elif value.startswith("//?/"):
+            value = value[4:]
+        return value.rstrip("/").casefold()
+    if value.startswith("/"):
+        return posixpath.normpath(value).rstrip("/") or "/"
+    return _directory_filter_path(os.path.abspath(value))
+
+
+def _project_directory_filters(
+    project_dirs: Optional[Sequence[str]], session_id: Optional[str]
+) -> Tuple[str, ...]:
+    if project_dirs and session_id is not None:
+        raise ValueError("--project-dir cannot be used with a session selector")
+    return tuple(dict.fromkeys(_directory_filter_path(p) for p in (project_dirs or ())))
+
+
 def _path_name(value: str) -> str:
     stripped = value.rstrip("/\\")
     if "\\" in stripped or re.match(r"^[A-Za-z]:", stripped):
@@ -629,6 +657,25 @@ class ProjectResolver:
 
     def resolve(self, conversation: ParsedConversation) -> str:
         return self.resolve_with_path(conversation).name
+
+    def matches_directories(
+        self, conversation: ParsedConversation, roots: Sequence[str]
+    ) -> bool:
+        paths = [conversation.cwd, self.resolve_with_path(conversation).path]
+        assignment = self.assignments.get(conversation.thread_id)
+        if isinstance(assignment, dict) and assignment.get("projectKind") == "local":
+            project_id = assignment.get("projectId")
+            if isinstance(project_id, str):
+                paths.extend(path for _, path in self.project_roots.get(project_id, []))
+        for path in paths:
+            if isinstance(path, str) and path.strip():
+                candidate = _directory_filter_path(path)
+                if any(
+                    candidate == root or candidate.startswith(root.rstrip("/") + "/")
+                    for root in roots
+                ):
+                    return True
+        return False
 
 
 def safe_component(value: str, fallback: str, limit: int = 120) -> str:
@@ -1077,7 +1124,9 @@ def export_history(
     created_until: Optional[str] = None,
     last_chat_since: Optional[str] = None,
     last_chat_until: Optional[str] = None,
+    project_dirs: Optional[Sequence[str]] = None,
 ) -> ExportSummary:
+    directory_roots = _project_directory_filters(project_dirs, session_id)
     created_range, last_chat_range = _date_filters(
         session_id, created_since, created_until, last_chat_since, last_chat_until
     )
@@ -1110,6 +1159,7 @@ def export_history(
     malformed_lines = 0
     matched_rollouts = 0
     date_filtered = 0
+    directory_filtered = 0
     missing_filter_timestamps = 0
     allocated = set()
     project_paths: Dict[str, Set[str]] = {}
@@ -1151,6 +1201,9 @@ def export_history(
             thread_ids.add(conversation.thread_id)
 
         for conversation in conversations.values():
+            if directory_roots and not resolver.matches_directories(conversation, directory_roots):
+                directory_filtered += 1
+                continue
             if ignore_archived and _conversation_is_archived(
                 conversation, archived_states
             ):
@@ -1222,6 +1275,7 @@ def export_history(
         date_filtered=date_filtered,
         missing_filter_timestamps=missing_filter_timestamps,
         merged_rollouts=histories.merged_rollouts,
+        directory_filtered=directory_filtered,
     )
 
 
@@ -1292,6 +1346,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         metavar="ID_OR_DEEP_LINK",
         help="named form of the optional session ID or Codex thread deep link",
     )
+    parser.add_argument(
+        "--project-dir", nargs="+", action="append", metavar="PATH",
+        help="export conversations under any directory or assigned project root; repeatable",
+    )
     for name in ("created", "last-chat"):
         for boundary in ("since", "until"):
             parser.add_argument(
@@ -1306,9 +1364,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if arguments.session_id is not None and arguments.named_session_id is not None:
         parser.error("SESSION_ID_OR_DEEP_LINK and --session-id cannot be used together")
     session_id = arguments.named_session_id or arguments.session_id
+    project_dirs = [path for group in (arguments.project_dir or []) for path in group]
     if session_id is not None and arguments.ignore_archived:
         parser.error("--ignore-archived cannot be used with a session selector")
     try:
+        _project_directory_filters(project_dirs, session_id)
         _date_filters(
             session_id, arguments.created_since, arguments.created_until,
             arguments.last_chat_since, arguments.last_chat_until,
@@ -1326,6 +1386,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             output_root,
             session_id=session_id,
             ignore_archived=arguments.ignore_archived,
+            project_dirs=project_dirs,
             created_since=arguments.created_since,
             created_until=arguments.created_until,
             last_chat_since=arguments.last_chat_since,
@@ -1341,6 +1402,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print("  archived conversations ignored: {}".format(summary.ignored_archived))
     print("  conversations outside date filters: {}".format(summary.date_filtered))
     print("  conversations missing filter timestamps: {}".format(summary.missing_filter_timestamps))
+    print("  conversations outside directory filters: {}".format(summary.directory_filtered))
     print("  duplicate rollouts excluded: {}".format(summary.duplicate_rollouts))
     print("  historical rollouts consolidated: {}".format(summary.merged_rollouts))
     print("  empty sessions: {}".format(summary.empty_sessions))
