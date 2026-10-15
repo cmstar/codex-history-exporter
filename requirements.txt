@@ -1,0 +1,2 @@
+# Only needed for .jsonl.zst logs; Python 3.14+ supplies compression.zstd.
+backports.zstd>=1.0; python_version < "3.14"

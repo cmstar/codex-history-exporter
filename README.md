@@ -5,8 +5,16 @@
 ## 要求
 
 - Python 3.9 或更高版本
-- 不需要安装第三方包
+- 普通 `.jsonl` 日志不需要第三方包；`.jsonl.zst` 压缩日志优先使用 Python 3.14+ 的 `compression.zstd` 标准库
 - 支持 Windows、macOS 与 Linux
+
+Python 3.9–3.13 读取压缩日志前，在项目根目录安装兼容依赖：
+
+```sh
+python -m pip install -r requirements.txt
+```
+
+Windows 使用 `py` 运行脚本时，对应运行 `py -m pip install -r requirements.txt`。依赖缺失时脚本会提示安装方式。解压在内存中完成，不会修改原始日志或在 Codex 数据目录生成解压副本。
 
 ## 使用
 
@@ -162,7 +170,9 @@ Path = '''/home/user/Workspace/项目1'''
 
 确认覆盖后，每次执行都会完整重建目标目录。脚本先在 staging 目录生成全部文件，成功后才替换现有输出；生成阶段失败时会保留上一次的结果。如果输出根目录被占用而无法整体改名，脚本会自动改用带备份和回滚的目录内替换。
 
-脚本会同时扫描 `sessions` 与 `archived_sessions`，同一个 Thread ID 最终只输出一个 Markdown 文件。状态数据库中的 `rollout_path` 优先决定当前日志；数据库没有该字段或记录时，通过日志的历史继承关系寻找唯一的最终版本，相同副本只保留一份。
+脚本会同时扫描 `sessions` 与 `archived_sessions` 下的 `.jsonl` 和 `.jsonl.zst`，同一个 Thread ID 最终只输出一个 Markdown 文件。状态数据库中的 `rollout_path` 优先决定当前日志；数据库仍指向压缩前的 `.jsonl` 路径时，可匹配对应的 `.jsonl.zst`。数据库没有该字段或记录时，通过日志的历史继承关系寻找唯一的最终版本，相同副本只保留一份。
+
+压缩基础日志、压缩历史分段和未压缩日志可以混合使用；历史字节边界与副本比较均基于解压后的原始字节，保留中文编码和换行格式。所需压缩日志损坏或截断时会报错并保留已有输出。
 
 对于没有历史继承信息且数据库未指定当前路径的旧日志，如果较短副本是完整副本的逐字节前缀，则使用完整副本；存在内容分歧时仍报错，不按文件大小或修改时间猜测当前版本。
 
@@ -185,5 +195,6 @@ Path = '''/home/user/Workspace/项目1'''
 ## 测试
 
 ```sh
+python -m pip install -r requirements.txt
 python -m unittest discover -s tests -v
 ```

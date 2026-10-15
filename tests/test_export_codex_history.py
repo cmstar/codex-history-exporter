@@ -1,3 +1,4 @@
+import io
 import json
 import sqlite3
 import tempfile
@@ -164,6 +165,190 @@ class InheritedHistoryTests(unittest.TestCase):
         self.assertEqual(summary.exported, 1)
         self.assertEqual(len(files), 1)
         return summary, files[0].read_text(encoding="utf-8")
+
+    def compress(self, path, keep_original=False):
+        if exporter._zstd is None:
+            self.skipTest("install requirements.txt to test compressed rollouts")
+        compressed = path.with_suffix(path.suffix + ".zst")
+        compressed.write_bytes(exporter._zstd.compress(path.read_bytes()))
+        if not keep_original:
+            path.unlink()
+        return compressed
+
+    def test_compressed_base_restores_selected_thread(self):
+        current = self.branch()
+        self.active(current)
+        compressed = self.compress(self.base)
+        summary, text = self.export(session_id="codex://threads/thread-1")
+        self.assertEqual(summary.discovered, 2)
+        self.assertEqual(summary.merged_rollouts, 1)
+        self.assertEqual(text.count("# 👤 User"), 2)
+        self.assertIn("前文回答", text)
+        self.assertIn("新回答", text)
+        self.assertNotIn("失效", text)
+        self.assertTrue(compressed.exists())
+        self.assertFalse(self.base.exists())
+
+    def test_compressed_multilevel_segments_and_stale_database_path(self):
+        first, last = self.numbered_history()
+        for path in (self.base, first, last):
+            self.compress(path)
+        _, text = self.export(created_since="20260719", created_until="20260719")
+        self.assertEqual(text.count("# 👤 User"), 3)
+        self.assertLess(text.index("前文回答"), text.index("新回答"))
+        self.assertLess(text.index("新回答"), text.index("第三轮回答"))
+        self.assertNotIn("被替换", text)
+        self.assertNotIn("失效", text)
+
+    def test_standalone_archived_compressed_log_can_be_parsed_and_exported(self):
+        archived = self.home / "archived_sessions" / "archived.jsonl"
+        archived.parent.mkdir()
+        archived.write_bytes(self.base.read_bytes())
+        self.base.unlink()
+        compressed = self.compress(archived)
+        conversation = exporter.parse_rollout(compressed)
+        self.assertTrue(conversation.archived)
+        self.assertEqual(conversation.source_path, compressed)
+        self.assertEqual(len(conversation.messages), 4)
+        summary, text = self.export()
+        self.assertEqual(summary.discovered, 1)
+        self.assertIn("前文回答", text)
+        self.assertIn("- Archived: `true`", text)
+
+    def test_compressed_current_log_with_relocated_database_path(self):
+        current = self.branch()
+        self.active("X:\\old-computer\\sessions\\" + current.name)
+        self.compress(current)
+        _, text = self.export()
+        self.assertIn("新回答", text)
+
+    def test_exact_database_path_wins_over_different_compressed_sibling(self):
+        self.active(self.base)
+        compressed = self.compress(self.base, keep_original=True)
+        other = (json.dumps(meta_row()) + "\n" + json.dumps(user_row("不应导出")) + "\n").encode()
+        compressed.write_bytes(exporter._zstd.compress(other))
+        _, text = self.export()
+        self.assertIn("前文回答", text)
+        self.assertNotIn("不应导出", text)
+
+    def test_stale_database_path_prefers_local_compressed_log_over_archived_name(self):
+        current = self.branch()
+        self.active(current)
+        self.compress(current)
+        write_jsonl(self.home / "archived_sessions" / current.name,
+                    [meta_row(), user_row("不应导出")])
+        _, text = self.export()
+        self.assertIn("新回答", text)
+        self.assertNotIn("不应导出", text)
+
+    def test_identical_compressed_and_plain_base_copies_do_not_duplicate_history(self):
+        self.branch()
+        self.compress(self.base, keep_original=True)
+        _, text = self.export()
+        self.assertEqual(text.count("# 👤 User"), 2)
+        self.assertEqual(text.count("前文回答"), 1)
+
+    def test_identical_compressed_and_plain_standalone_copies_are_deduplicated(self):
+        self.compress(self.base, keep_original=True)
+        summary, text = self.export()
+        self.assertEqual(summary.duplicate_rollouts, 1)
+        self.assertEqual(text.count("# 👤 User"), 2)
+
+    def test_longer_compressed_copy_preserves_later_messages(self):
+        copy = self.home / "archived_sessions" / self.base.name
+        copy.parent.mkdir()
+        copy.write_bytes(self.base.read_bytes() + (
+            json.dumps(user_row("后续问题"), ensure_ascii=False) + "\n"
+        ).encode("utf-8"))
+        self.compress(copy)
+        summary, text = self.export()
+        self.assertIn("后续问题", text)
+        self.assertEqual(summary.merged_rollouts, 1)
+
+    def test_compressed_crlf_and_non_ascii_boundary_uses_uncompressed_bytes(self):
+        raw = self.base.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+        self.base.write_bytes(raw)
+        self.branch()
+        compressed = self.compress(self.base)
+        self.assertEqual(exporter._read_rollout_bytes(compressed), raw)
+        _, text = self.export()
+        self.assertIn("前文回答", text)
+        self.assertNotIn("失效", text)
+
+    def test_concatenated_zstd_frames_preserve_history_boundary(self):
+        self.branch()
+        raw = self.base.read_bytes()
+        compressed = self.compress(self.base)
+        middle = len(raw) // 2
+        compressed.write_bytes(exporter._zstd.compress(raw[:middle])
+                               + exporter._zstd.compress(raw[middle:]))
+        self.assertEqual(exporter._read_rollout_bytes(compressed), raw)
+        _, text = self.export()
+        self.assertIn("前文回答", text)
+
+    def test_compressed_base_still_rejects_incorrect_byte_boundary(self):
+        current = self.branch()
+        rows = [json.loads(line) for line in current.read_text(encoding="utf-8").splitlines()]
+        rows[0]["payload"]["history_base"]["end_byte_offset"] += 1
+        write_jsonl(current, rows)
+        self.compress(self.base)
+        with self.assertRaisesRegex(RuntimeError, "history_base"):
+            self.export()
+
+    def test_corrupt_compressed_log_reports_cli_error_and_preserves_output(self):
+        self.active(self.base)
+        compressed = self.compress(self.base)
+        compressed.write_bytes(b"not a zstd frame")
+        self.output.mkdir()
+        marker = self.output / "keep.txt"
+        marker.write_text("keep", encoding="utf-8")
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", stderr):
+            result = exporter.main(["thread-1", "--codex-home", str(self.home),
+                                    "--output", str(self.output), "--force"])
+        self.assertEqual(result, 1)
+        self.assertIn("cannot decompress", stderr.getvalue())
+        self.assertIn(compressed.name, stderr.getvalue())
+        self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
+        self.assertFalse(self.output.with_name("output.__staging__").exists())
+
+    def test_truncated_compressed_log_is_not_exported_partially(self):
+        self.active(self.base)
+        compressed = self.compress(self.base)
+        compressed.write_bytes(compressed.read_bytes()[:-5])
+        self.output.mkdir()
+        marker = self.output / "keep.txt"
+        marker.write_text("keep", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "cannot decompress"):
+            self.export(session_id="thread-1")
+        with self.assertRaisesRegex(RuntimeError, "cannot decompress"):
+            exporter.parse_rollout(compressed)
+        self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
+
+    def test_missing_zstd_dependency_reports_installation_and_preserves_output(self):
+        self.active(self.base)
+        self.compress(self.base)
+        self.output.mkdir()
+        marker = self.output / "keep.txt"
+        marker.write_text("keep", encoding="utf-8")
+        with mock.patch.object(exporter, "_zstd", None):
+            with self.assertRaisesRegex(RuntimeError, "pip install -r requirements.txt"):
+                self.export(session_id="thread-1")
+        self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
+
+    def test_plain_logs_need_no_zstd_dependency(self):
+        with mock.patch.object(exporter, "_zstd", None):
+            _, text = self.export()
+        self.assertIn("前文回答", text)
+
+    def test_unrelated_corrupt_compressed_log_does_not_block_selected_thread(self):
+        if exporter._zstd is None:
+            self.skipTest("install requirements.txt to test compressed rollouts")
+        (self.home / "sessions" / "unrelated.jsonl.zst").write_bytes(b"invalid frame")
+        _, text = self.export(session_id="thread-1")
+        self.assertIn("前文回答", text)
+        with self.assertRaisesRegex(RuntimeError, "cannot decompress"):
+            self.export()
 
     def test_selected_thread_restores_prefix_and_replaces_old_branch(self):
         current = self.branch()

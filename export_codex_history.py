@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import json
 import ntpath
 import os
@@ -17,6 +17,14 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+try:
+    from compression import zstd as _zstd
+except ImportError:
+    try:
+        from backports import zstd as _zstd
+    except ImportError:
+        _zstd = None
 
 
 INVALID_COMPONENT_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -264,6 +272,44 @@ def _is_subagent(meta: dict) -> bool:
     return isinstance(source, dict) and "subagent" in source
 
 
+class _CompressedRolloutError(RuntimeError):
+    """A compressed log cannot be read without losing history."""
+
+
+def _uncompressed_path(path: Path) -> Path:
+    return path.with_suffix("") if path.name.endswith(".jsonl.zst") else path
+
+
+@contextmanager
+def _compressed_rollout_stream(path: Path, stream):
+    try:
+        with stream:
+            yield stream
+    except (EOFError, _zstd.ZstdError) as error:
+        raise _CompressedRolloutError(
+            "cannot decompress {}: {}".format(path, error)
+        ) from error
+
+
+def _open_rollout(path: Path, mode: str = "rt"):
+    options = {"encoding": "utf-8", "errors": "replace"} if mode == "rt" else {}
+    if _uncompressed_path(path) == path:
+        return path.open(mode, **options)
+    if _zstd is None:
+        raise _CompressedRolloutError(
+            "cannot read compressed rollout {}: Zstandard support is unavailable; "
+            "use Python 3.14+ with compression.zstd, or install the backport on "
+            "Python 3.9-3.13: python -m pip install -r requirements.txt".format(path)
+        )
+    return _compressed_rollout_stream(path, _zstd.open(path, mode, **options))
+
+
+def _read_rollout_bytes(path: Path) -> bytes:
+    # Keep the original UTF-8 bytes and newlines for history_base byte offsets.
+    with _open_rollout(path, "rb") as stream:
+        return stream.read()
+
+
 def _parse_rollout_with_status(
     path: Path, session_id: Optional[str] = None,
     history: Optional[Iterable[str]] = None,
@@ -274,7 +320,7 @@ def _parse_rollout_with_status(
     sequence = 0
 
     try:
-        stream = (path.open("r", encoding="utf-8", errors="replace")
+        stream = (_open_rollout(path)
                   if history is None else nullcontext(history))
     except OSError:
         return _ParseOutcome(None, "invalid", 0)
@@ -771,7 +817,8 @@ def _discover_rollouts(codex_home: Path) -> List[Path]:
     paths = []
     for root in roots:
         if root.is_dir():
-            paths.extend(path for path in root.rglob("*.jsonl") if path.is_file())
+            for pattern in ("*.jsonl", "*.jsonl.zst"):
+                paths.extend(path for path in root.rglob(pattern) if path.is_file())
     return sorted(paths)
 
 
@@ -810,6 +857,28 @@ def _load_database_rollout_paths(codex_home: Path) -> Dict[str, str]:
         return {}
 
 
+def _active_rollout_candidates(paths: Sequence[Path], active: str) -> List[Path]:
+    active_paths = {Path(active)}
+    try:
+        # Resolve both sides: Codex home may be a symlink or Windows junction.
+        active_paths.add(Path(active).resolve())
+    except (OSError, RuntimeError):
+        pass  # Retain filename fallback for unavailable or copied paths.
+    resolved_paths = {p: p.resolve() for p in paths}
+    for logical in (False, True):
+        def normalize(path):
+            return _normalize_path(str(_uncompressed_path(path) if logical else path))
+
+        active_names = {normalize(p) for p in active_paths}
+        candidates = [p for p in paths if normalize(resolved_paths[p]) in active_names]
+        if candidates:
+            return candidates
+    # A copied Codex home can contain paths from a different machine. Compression
+    # can also leave the database pointing at the previous .jsonl filename.
+    active_name = _uncompressed_path(Path(_path_name(active))).name
+    return [p for p in paths if _uncompressed_path(p).name == active_name]
+
+
 class _RolloutHistories:
     """Resolve history_base before applying message extraction or rollback events.
 
@@ -824,10 +893,11 @@ class _RolloutHistories:
         self.metadata: Dict[Path, dict] = {}
         self.groups: Dict[str, List[Path]] = {}
         self.segments: Dict[str, List[Path]] = {}
+        self.read_errors: Dict[Path, _CompressedRolloutError] = {}
         self.merged_rollouts = 0
         for path in paths:
             try:
-                with path.open("r", encoding="utf-8", errors="replace") as stream:
+                with _open_rollout(path) as stream:
                     for line in stream:
                         try:
                             row = json.loads(line)
@@ -851,20 +921,35 @@ class _RolloutHistories:
                                 segment = re.fullmatch(
                                     r"rollout-.+-" + re.escape(thread_id)
                                     + r"_([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})",
-                                    path.stem,
+                                    _uncompressed_path(path).stem,
                                 )
                                 if segment:
                                     self.segments.setdefault(segment[1], []).append(path)
                         break
+            except _CompressedRolloutError as error:
+                # Defer errors so an unrelated unreadable log does not block a
+                # selected conversation. Batch exports must not omit such logs.
+                self.read_errors[path] = error
             except OSError:
                 pass  # The normal parser retains invalid-rollout reporting.
+
+    def _raise_read_error(self, thread_id: Optional[str]):
+        active = self.active_paths.get(thread_id)
+        candidates = (_active_rollout_candidates(list(self.read_errors), active)
+                      if active else [])
+        for path, error in self.read_errors.items():
+            if (thread_id is None or path in candidates
+                    or self.metadata.get(path, {}).get("id") == thread_id
+                    or re.search(r"(?:^|[-_])" + re.escape(thread_id) + r"(?:_|$)",
+                                 _uncompressed_path(path).stem)):
+                raise error
 
     def _resolve(self, path: Path, cache: dict, stack: tuple = (), limit=None):
         if path in stack:
             raise RuntimeError("cyclic history_base: {}".format(path))
         raw = cache.get(path)
         if raw is None:
-            raw = path.read_bytes().splitlines(keepends=True)
+            raw = _read_rollout_bytes(path).splitlines(keepends=True)
             cache[path] = raw
         local = raw if limit is None else raw[:limit]
         meta = self.metadata[path]
@@ -893,7 +978,7 @@ class _RolloutHistories:
                 continue
             parent_raw = cache.get(candidate)
             if parent_raw is None:
-                parent_raw = candidate.read_bytes().splitlines(keepends=True)
+                parent_raw = _read_rollout_bytes(candidate).splitlines(keepends=True)
                 cache[candidate] = parent_raw
             local_count = self._prefix_length(parent_raw, count, offset)
             if local_count is None:
@@ -903,6 +988,7 @@ class _RolloutHistories:
                 created = meta.get("timestamp")
             matches.append((prefix, ancestors, created))
         if not matches:
+            self._raise_read_error(base["thread_id"])
             raise RuntimeError("missing or mismatched history_base for {}".format(path))
         prefix, ancestors, created = matches[0]
         if any(other[0] != prefix for other in matches[1:]):
@@ -941,6 +1027,7 @@ class _RolloutHistories:
         return None
 
     def outcomes(self, session_id: Optional[str]):
+        self._raise_read_error(session_id)
         handled = set()
         for path in self.paths:
             meta = self.metadata.get(path, {})
@@ -958,7 +1045,7 @@ class _RolloutHistories:
             paginated = any(self.metadata[p].get("history_base") is not None for p in group)
             if not paginated and not active:
                 if len(group) > 1:
-                    copies = {p: p.read_bytes() for p in group}
+                    copies = {p: _read_rollout_bytes(p) for p in group}
                     longest = max(copies.values(), key=len)
                     if all(longest.startswith(raw) for raw in copies.values()):
                         complete = [p for p in group if copies[p] == longest]
@@ -969,16 +1056,7 @@ class _RolloutHistories:
                 continue
             cache = {}
             if active:
-                active_names = {_normalize_path(active)}
-                try:
-                    # Resolve both sides: Codex home may be a symlink or Windows junction.
-                    active_names.add(_normalize_path(str(Path(active).resolve())))
-                except (OSError, RuntimeError):
-                    pass  # Retain filename fallback for unavailable or copied paths.
-                candidates = [p for p in group if _normalize_path(str(p.resolve())) in active_names]
-                if not candidates:
-                    # A copied Codex home can contain paths from a different machine.
-                    candidates = [p for p in group if p.name == _path_name(active)]
+                candidates = _active_rollout_candidates(group, active)
                 if len(candidates) != 1:
                     raise RuntimeError("cannot locate current rollout for thread {}: {}".format(thread_id, active))
                 selected = candidates[0]
