@@ -1356,7 +1356,7 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(len(files), 2)
             self.assertNotIn("Thread ID: `thread-three`", markdown)
 
-    def test_cli_declines_to_replace_a_nonempty_output_directory(self):
+    def test_cli_cancels_without_starting_export(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             codex_home = self.make_codex_home(root)
@@ -1365,12 +1365,15 @@ class EndToEndTests(unittest.TestCase):
             stale = output / "keep.txt"
             stale.write_text("keep", encoding="utf-8")
 
-            with mock.patch("builtins.input", return_value="n"):
+            with mock.patch("builtins.input", return_value="3"), mock.patch.object(
+                exporter, "export_history"
+            ) as export:
                 exit_code = exporter.main(
                     ["--codex-home", str(codex_home), "--output", str(output)]
                 )
 
             self.assertEqual(exit_code, 0)
+            export.assert_not_called()
             self.assertEqual(stale.read_text(encoding="utf-8"), "keep")
             self.assertEqual(list(output.rglob("*.md")), [])
 
@@ -1383,7 +1386,7 @@ class EndToEndTests(unittest.TestCase):
             stale = output / "stale.txt"
             stale.write_text("old", encoding="utf-8")
 
-            with mock.patch("builtins.input", return_value="yes"):
+            with mock.patch("builtins.input", return_value="2"):
                 exit_code = exporter.main(
                     ["--codex-home", str(codex_home), "--output", str(output)]
                 )
@@ -1391,6 +1394,178 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertFalse(stale.exists())
             self.assertEqual(len(list(output.rglob("*.md"))), 2)
+
+    def test_cli_merges_new_files_and_preserves_existing_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            codex_home = self.make_codex_home(root)
+            write_jsonl(codex_home / "session_index.jsonl", [
+                {"id": "thread-one", "thread_name": "First conversation"},
+                {"id": "thread-two", "thread_name": "Second conversation"},
+            ])
+            output = root / "output"
+            exporter.export_history(codex_home, output, session_id="thread-one")
+            (output / "Alpha" / "notes.txt").write_bytes(b"project notes")
+            (output / "Other" / "nested").mkdir(parents=True)
+            (output / "Other" / "nested" / "keep.txt").write_bytes(b"keep")
+            (output / "projects.toml").write_bytes(b"# Existing index\n")
+            previous = {
+                path.relative_to(output): path.read_bytes()
+                for path in output.rglob("*") if path.is_file()
+            }
+            original_directories = {
+                path: (path.stat().st_dev, path.stat().st_ino)
+                for path in (output, output / "Alpha", output / "Other" / "nested")
+            }
+
+            with mock.patch("builtins.input", return_value="1"), mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                code = exporter.main([
+                    "codex://threads/thread-two", "--codex-home", str(codex_home),
+                    "-o", str(output),
+                ])
+
+            self.assertEqual(code, 0)
+            self.assertEqual(len(list(output.rglob("*.md"))), 2)
+            for relative, content in previous.items():
+                self.assertEqual((output / relative).read_bytes(), content)
+            for path, identity in original_directories.items():
+                self.assertEqual((path.stat().st_dev, path.stat().st_ino), identity)
+            self.assertIn("1. Merge (overwrite files with the same name)", stdout.getvalue())
+            self.assertIn("2. Replace (delete all existing contents)", stdout.getvalue())
+            self.assertIn("3. Cancel", stdout.getvalue())
+
+    def test_merge_overwrites_matching_filename_even_for_a_different_thread(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            codex_home = self.make_codex_home(root)
+            output = root / "output"
+            exporter.export_history(codex_home, output, session_id="thread-one")
+            original = next(output.rglob("*.md"))
+
+            with mock.patch("builtins.input", return_value="1"), mock.patch("builtins.print"):
+                code = exporter.main([
+                    "thread-two", "--codex-home", str(codex_home), "-o", str(output),
+                ])
+
+            self.assertEqual(code, 0)
+            self.assertEqual(list(output.rglob("*.md")), [original])
+            content = original.read_text(encoding="utf-8")
+            self.assertIn("- Thread ID: `thread-two`", content)
+            self.assertNotIn("- Thread ID: `thread-one`", content)
+
+    def test_merge_preserves_old_filename_when_the_same_thread_is_renamed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            codex_home = self.make_codex_home(root)
+            output = root / "output"
+            exporter.export_history(codex_home, output, session_id="thread-one")
+            original = next(output.rglob("*.md"))
+            original_content = original.read_bytes()
+            write_jsonl(codex_home / "session_index.jsonl", [
+                {"id": "thread-one", "thread_name": "New title"},
+            ])
+
+            exporter.export_history(codex_home, output, session_id="thread-one", merge_output=True)
+
+            self.assertEqual(len(list(output.rglob("*.md"))), 2)
+            self.assertEqual(original.read_bytes(), original_content)
+
+    def test_full_merge_overwrites_project_index_and_preserves_other_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            codex_home = self.make_codex_home(root)
+            output = root / "output"
+            output.mkdir()
+            (output / "projects.toml").write_text("# Old index\n", encoding="utf-8")
+            (output / "keep.md").write_bytes(b"unrelated markdown")
+
+            summary = exporter.export_history(codex_home, output, merge_output=True)
+
+            self.assertEqual(summary.exported, 2)
+            self.assertEqual((output / "keep.md").read_bytes(), b"unrelated markdown")
+            self.assertEqual(len(list((output / "Alpha").glob("*.md"))), 2)
+            self.assertEqual(
+                (output / "projects.toml").read_text(encoding="utf-8"),
+                exporter.render_project_index({"Alpha": {r"C:\Work\Alpha"}}),
+            )
+
+    def test_failed_generation_before_merge_preserves_original_output(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            codex_home = self.make_codex_home(root)
+            output = root / "output"
+            exporter.export_history(codex_home, output)
+            previous = {
+                path.relative_to(output): path.read_bytes()
+                for path in output.rglob("*") if path.is_file()
+            }
+
+            original_render = exporter.render_markdown
+            rendered = []
+
+            def fail_second_render(*args):
+                rendered.append(args[0].thread_id)
+                if len(rendered) == 2:
+                    raise OSError("write failed")
+                return original_render(*args)
+
+            with mock.patch.object(exporter, "render_markdown", side_effect=fail_second_render):
+                with self.assertRaisesRegex(OSError, "write failed"):
+                    exporter.export_history(codex_home, output, merge_output=True)
+
+            self.assertEqual(len(rendered), 2)
+            self.assertEqual(previous, {
+                path.relative_to(output): path.read_bytes()
+                for path in output.rglob("*") if path.is_file()
+            })
+            self.assertFalse(output.with_name("output.__staging__").exists())
+
+    def test_merge_copy_error_stops_immediately_and_keeps_partial_output(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            codex_home = self.make_codex_home(root)
+            output = root / "output"
+            exporter.export_history(codex_home, output)
+            (output / "notes.txt").write_bytes(b"keep notes")
+            previous = {
+                path.relative_to(output): path.read_bytes()
+                for path in output.rglob("*") if path.is_file()
+            }
+            for name, thread_id in (("one", "thread-one"), ("two", "thread-two")):
+                write_jsonl(codex_home / "sessions" / "2026" / "07" / "19" / (name + ".jsonl"), [
+                    meta_row(thread_id), user_row("Updated question"), agent_event_row("Updated answer"),
+                ])
+            staging = output.with_name("output.__staging__")
+            original_copy = exporter.shutil.copy2
+            attempts = []
+
+            def fail_second_copy(source, target):
+                # All export files must exist before copying starts. Old output
+                # files must not have been copied back into the staging tree.
+                self.assertEqual(len(list(staging.rglob("*.md"))), 2)
+                self.assertTrue((staging / "projects.toml").is_file())
+                self.assertFalse((staging / "notes.txt").exists())
+                attempts.append((target.relative_to(output), source.read_bytes()))
+                if len(attempts) == 2:
+                    raise OSError("copy failed")
+                return original_copy(source, target)
+
+            with mock.patch.object(exporter.shutil, "copy2", side_effect=fail_second_copy), \
+                    mock.patch("builtins.input", return_value="1"), \
+                    mock.patch("sys.stderr", new_callable=io.StringIO) as stderr, \
+                    mock.patch("sys.stdout", new_callable=io.StringIO):
+                code = exporter.main(["--codex-home", str(codex_home), "-o", str(output)])
+
+            self.assertEqual(code, 1)
+            self.assertIn("copy failed", stderr.getvalue())
+            self.assertEqual(len(attempts), 2)
+            copied_path, copied_content = attempts[0]
+            self.assertNotEqual(previous[copied_path], copied_content)
+            for relative, content in previous.items():
+                expected = copied_content if relative == copied_path else content
+                self.assertEqual((output / relative).read_bytes(), expected)
+            self.assertFalse(staging.exists())
+            self.assertFalse(output.with_name("output.__backup__").exists())
 
     def test_cli_force_replaces_custom_output_without_prompting(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1692,6 +1867,50 @@ class DateFilterTests(unittest.TestCase):
 
 
 class OutputSafetyTests(unittest.TestCase):
+    def test_merge_rejects_file_directory_conflict_without_copying_inside_it(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            staging = root / "staging"
+            staging.mkdir()
+            (staging / "conflict.md").write_bytes(b"new file")
+            output = root / "output"
+            (output / "conflict.md").mkdir(parents=True)
+            marker = output / "conflict.md" / "keep.txt"
+            marker.write_bytes(b"keep")
+
+            with self.assertRaises(IsADirectoryError):
+                exporter._merge_staging(staging, output)
+
+            self.assertEqual(marker.read_bytes(), b"keep")
+            self.assertEqual(list((output / "conflict.md").iterdir()), [marker])
+
+    def test_existing_empty_directory_also_offers_the_menu(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with mock.patch("builtins.input", return_value="1") as prompt, mock.patch("builtins.print"):
+                self.assertEqual(exporter._choose_output_action(Path(temp), False), "merge")
+            prompt.assert_called_once()
+
+    def test_new_directory_does_not_prompt(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with mock.patch("builtins.input") as prompt:
+                self.assertEqual(exporter._choose_output_action(Path(temp) / "new", False), "replace")
+            prompt.assert_not_called()
+
+    def test_output_menu_retries_invalid_input(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with mock.patch("builtins.input", side_effect=["y", "4", " 2 "]) as prompt, mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                self.assertEqual(exporter._choose_output_action(Path(temp), False), "replace")
+            self.assertEqual(prompt.call_count, 3)
+            self.assertIn("Invalid option. Please enter 1, 2, or 3.", stdout.getvalue())
+
+    def test_output_menu_defaults_to_cancel_and_handles_interruption(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for answer in ("", "3", EOFError(), KeyboardInterrupt()):
+                with self.subTest(answer=answer):
+                    kwargs = {"side_effect": answer} if isinstance(answer, BaseException) else {"return_value": answer}
+                    with mock.patch("builtins.input", **kwargs), mock.patch("builtins.print"):
+                        self.assertIsNone(exporter._choose_output_action(Path(temp), False))
+
     def test_absolute_output_path_normalization_does_not_resolve_links(self):
         relative = Path(".output")
 

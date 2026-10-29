@@ -1122,6 +1122,7 @@ def _allocate_output_path(
     allocated: set,
 ) -> Path:
     folder = safe_component(project, "chat")
+    _assert_not_symlink(staging / folder)
     timestamp = conversation.last_timestamp.astimezone().strftime("%Y%m%d%H%M%S")
     safe_title = safe_component(title, conversation.thread_id)
     filename = "{}__{}.md".format(timestamp, safe_title)
@@ -1193,6 +1194,23 @@ def _publish_staging(staging: Path, output_root: Path, backup: Path) -> None:
         shutil.rmtree(backup)
 
 
+def _merge_staging(staging: Path, output_root: Path) -> None:
+    """Copy files into existing directories, stopping on error without rollback."""
+    _assert_not_symlink(staging)
+    _assert_not_symlink(output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+    for source in sorted(staging.iterdir(), key=lambda path: path.name.casefold()):
+        target = output_root / source.name
+        _assert_not_symlink(source)
+        _assert_not_symlink(target)
+        if source.is_dir():
+            _merge_staging(source, target)
+        else:
+            if target.is_dir():
+                raise IsADirectoryError("expected file but found directory: {}".format(target))
+            shutil.copy2(source, target)
+
+
 def export_history(
     codex_home: Path,
     output_root: Path,
@@ -1203,6 +1221,7 @@ def export_history(
     last_chat_since: Optional[str] = None,
     last_chat_until: Optional[str] = None,
     project_dirs: Optional[Sequence[str]] = None,
+    merge_output: bool = False,
 ) -> ExportSummary:
     directory_roots = _project_directory_filters(project_dirs, session_id)
     created_range, last_chat_range = _date_filters(
@@ -1210,6 +1229,9 @@ def export_history(
     )
     codex_home = Path(codex_home).expanduser().resolve()
     output_root = _absolute_without_resolving(Path(output_root).expanduser())
+    _assert_not_symlink(output_root)
+    if output_root.exists() and not output_root.is_dir():
+        raise RuntimeError("output path is not a directory: {}".format(output_root))
     if not codex_home.is_dir():
         raise FileNotFoundError("Codex home does not exist: {}".format(codex_home))
     if session_id is not None:
@@ -1313,6 +1335,7 @@ def export_history(
                 staging, project, conversation, title, allocated
             )
             target.parent.mkdir(parents=True, exist_ok=True)
+            _assert_not_symlink(target)
             with target.open("w", encoding="utf-8", newline="\n") as stream:
                 stream.write(render_markdown(conversation, title, project))
             exported += 1
@@ -1329,11 +1352,17 @@ def export_history(
                 "session has no exportable messages: {}".format(session_id)
             )
         if session_id is None:
-            with (staging / "projects.toml").open(
+            index_path = staging / "projects.toml"
+            _assert_not_symlink(index_path)
+            with index_path.open(
                 "w", encoding="utf-8", newline="\n"
             ) as stream:
                 stream.write(render_project_index(project_paths))
-        _publish_staging(staging, output_root, backup)
+        if merge_output:
+            _merge_staging(staging, output_root)
+            shutil.rmtree(staging)
+        else:
+            _publish_staging(staging, output_root, backup)
     except Exception:
         if staging.exists() and not staging.is_symlink():
             shutil.rmtree(staging)
@@ -1366,26 +1395,28 @@ def _default_codex_home(argument: Optional[str]) -> Path:
     return Path.home() / ".codex"
 
 
-def _confirm_output_replacement(output_root: Path, force: bool) -> bool:
-    if output_root.is_symlink():
-        raise RuntimeError(
-            "refusing to replace symbolic-link path: {}".format(output_root)
-        )
+def _choose_output_action(output_root: Path, force: bool) -> Optional[str]:
+    _assert_not_symlink(output_root)
     if not output_root.exists():
-        return True
+        return "replace"
     if not output_root.is_dir():
         raise RuntimeError("output path is not a directory: {}".format(output_root))
-    if not any(output_root.iterdir()) or force:
-        return True
-    try:
-        answer = input(
-            "Output directory '{}' is not empty. Overwrite its contents? [y/N]: ".format(
-                output_root
-            )
-        )
-    except EOFError:
-        answer = ""
-    return answer.strip().casefold() in {"y", "yes"}
+    if force:
+        return "replace"
+    print("Output directory '{}' already exists.".format(output_root))
+    print("  1. Merge (overwrite files with the same name)")
+    print("  2. Replace (delete all existing contents)")
+    print("  3. Cancel")
+    while True:
+        try:
+            answer = input("Choose an option [1/2/3] (default: 3): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if answer in {"", "3"}:
+            return None
+        if answer in {"1", "2"}:
+            return "merge" if answer == "1" else "replace"
+        print("Invalid option. Please enter 1, 2, or 3.")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -1411,7 +1442,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "-f",
         "--force",
         action="store_true",
-        help="replace a nonempty output directory without prompting",
+        help="replace an existing output directory without prompting (option 2)",
     )
     parser.add_argument(
         "--ignore-archived",
@@ -1456,7 +1487,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if arguments.output
             else Path.cwd() / "output"
         )
-        if not _confirm_output_replacement(output_root, arguments.force):
+        output_action = _choose_output_action(output_root, arguments.force)
+        if output_action is None:
             print("Export cancelled. Existing output was not changed.")
             return 0
         summary = export_history(
@@ -1469,6 +1501,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             created_until=arguments.created_until,
             last_chat_since=arguments.last_chat_since,
             last_chat_until=arguments.last_chat_until,
+            merge_output=output_action == "merge",
         )
     except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
         print("error: {}".format(error), file=sys.stderr)
